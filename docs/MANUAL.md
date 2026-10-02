@@ -1,6 +1,6 @@
-# IntelliBranch: Embedded Neural AI Manual & Tutorial for Go Developers
+# NeuroGate: Embedded Neural AI Manual & Tutorial for Go Developers
 
-This guide provides pure Go engineers with a deep-dive technical manual and hands-on tutorial for **IntelliBranch: An Engine That Directly Creates and Runs Its Own Domain Artificial Intelligence**. Stop borrowing external models—learn how to design domain knowledge, generate lightweight neural networks from scratch in seconds, and execute microsecond AI-driven control flow with zero dependencies.
+This guide provides pure Go engineers with a deep-dive technical manual and hands-on tutorial for **NeuroGate: An Engine That Directly Creates and Runs Its Own Domain Artificial Intelligence**. Stop borrowing external models—learn how to design domain knowledge, generate lightweight neural networks from scratch in seconds, and execute microsecond AI-driven control flow with zero dependencies.
 
 ---
 
@@ -67,7 +67,7 @@ case "refund":
 
 This works if and only if `input` precisely equals `"refund"`. If the caller sends `"refnd"`, `"I need my money back"`, or `"reverse charge"`, the statement falls through.
 
-**IntelliBranch** replaces discrete byte comparison with **continuous vector coordinate proximity**:
+**NeuroGate** replaces discrete byte comparison with **continuous vector coordinate proximity**:
 
 ```text
 [ Input Text ] ("can u refund order #49281")
@@ -90,7 +90,7 @@ This works if and only if `input` precisely equals `"refund"`. If the caller sen
 
 ### 1.1. Two Phases: Offline Compilation vs. In-Memory Routing
 
-IntelliBranch divides work cleanly into two separate phases:
+NeuroGate divides work cleanly into two separate phases:
 
 | Dimension | Phase 1: Model Compilation (Offline Training) | Phase 2: Router Dispatch (Live In-Memory Inference) |
 | :--- | :--- | :--- |
@@ -105,14 +105,14 @@ IntelliBranch divides work cleanly into two separate phases:
 ```text
 ┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
 │ 1. AI Design           │ ────▶ │ 2. Build Your Own AI   │ ────▶ │ 3. Wire AI Handlers    │ ────▶ │ 4. AI-Powered Branching│
-│    (CSV Knowledge)     │       │    (ib-train CLI)      │       │    (router.Bind)       │       │    (Dispatch / 6μs)    │
+│    (CSV Knowledge)     │       │ (TrainModel / Open)    │       │    (router.Branch)     │       │    (Dispatch / 30μs)   │
 └────────────────────────┘       └────────────────────────┘       └────────────────────────┘       └────────────────────────┘
 ```
 
-1. **AI Design (`sample_dataset.csv`)**: Define target classes and author 30–150 representative real-world phrasing examples per class.
-2. **Build Your Own AI (`ib-train`)**: The compiler engine builds subword merges and crystallizes neural weights into a compact Little-Endian binary (`.bin`) with SHA-256 integrity verification.
-3. **Wire AI Handlers (`main.go`)**: Initialize `Router`, bind target labels to standard Go functions, and register safety fallbacks.
-4. **AI-Powered Branching (`router.Dispatch`)**: Incoming requests are evaluated and dispatched within 6 microseconds with single-digit memory allocations (`sync.Pool`).
+1. **AI Design (`train.csv`)**: Define target classes and author 30–150 representative real-world phrasing examples per class.
+2. **Build Your Own AI (`neurogate.TrainModel`)**: The library engine extracts subwords, trains neural weights, and crystallizes them into a compact Little-Endian binary (`.bin`) with SHA-256 integrity verification.
+3. **Wire AI Handlers (`router.Branch`)**: Initialize `Router`, bind target labels to standard Go functions, and register safety fallbacks.
+4. **AI-Powered Branching (`router.Dispatch`)**: Incoming requests are evaluated and dispatched within microseconds (~30 μs) with zero allocations (`sync.Pool`).
 
 ---
 
@@ -323,17 +323,17 @@ import (
 	"fmt"
 	"log"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 func main() {
-	gate, err := intellibranch.NewNeuroGate("weights/demo_iot.bin")
+	gate, err := neurogate.NewNeuroGate("weights/demo_iot.bin")
 	if err != nil {
 		log.Fatalf("Failed to init NeuroGate: %v", err)
 	}
 
 	// 1. Calibrate manifold centroid from training samples
-	samples, _ := intellibranch.LoadCSVDataset("data/demo_iot.csv")
+	samples, _ := neurogate.LoadCSVDataset("data/demo_iot.csv")
 	gate.CalibrateDomainCentroid(samples).SetMinCosineSim(0.35)
 
 	// 2. Bind route actions with symbolic anchor soft-biases
@@ -408,18 +408,56 @@ delivery,Delivery
 
 ### Step 2: Building Your Own AI — Training & Model Generation (`ib-train`)
 
-IntelliBranch provides two distinct training mechanisms: **[1. Standalone CLI Tool]** for CI/CD and terminal usage, and **[2. In-Code Programmatic Go API]** for dynamic in-process training.
+NeuroGate provides two distinct training mechanisms: **[1. In-Code Programmatic Go API]** for direct embedded integration, and **[2. Standalone CLI Tool]** hosted in the companion demo repository.
 
-#### 1. Method A: Standalone CLI Training (`ib-train`)
+#### 1. Method A: Programmatic Training via Go Code (Primary Library API)
 
-Build the standalone compiler binary and run the training pipeline:
+Train and export binary weights directly inside your Go application without external processes:
+
+```go
+package main
+
+import (
+	"log"
+
+	"github.com/gluedays-cyber/neurogate"
+)
+
+func main() {
+	// 1. Load samples from CSV
+	samples, err := neurogate.LoadCSVDataset("data/support_intents.csv")
+	if err != nil {
+		log.Fatalf("Dataset load error: %v", err)
+	}
+
+	// 2. Configure training hyperparameters
+	config := neurogate.DefaultTrainConfig()
+	config.Epochs = 50
+	config.LearningRate = 0.005
+	config.TargetVocabSize = 250
+
+	// 3. Execute BPE + AdamW training pipeline
+	model, err := neurogate.TrainModel(samples, config)
+	if err != nil {
+		log.Fatalf("Training failed: %v", err)
+	}
+
+	// 4. Serialize to Little-Endian binary with SHA-256 integrity hash
+	if err := neurogate.SaveBinaryModel("weights/support.bin", model); err != nil {
+		log.Fatalf("Model export failed: %v", err)
+	}
+
+	log.Println("Model successfully trained and saved!")
+}
+```
+
+#### 2. Method B: Standalone CLI Training (`ib-train` in `NeuroGate - demo`)
+
+For build scripts, CI/CD automation, and terminal usage, the standalone `ib-train` CLI utility is provided in the companion **[NeuroGate - demo](../../NeuroGate%20-%20demo)** repository:
 
 ```bash
-# 1. Compile the training tool
-go build -ldflags="-s -w" -o bin/ib-train.exe ./cmd/ib-train
-
-# 2. Compile model weights into Little-Endian binary
-./bin/ib-train.exe -data data/support_intents.csv -out weights/support.bin -epochs 50 -lr 0.005 -vocab 250 -seed 42
+# In NeuroGate - demo directory:
+go run ./cmd/ib-train -data data/support_intents.csv -out weights/support.bin -epochs 50 -lr 0.005 -vocab 250 -seed 42
 ```
 
 ##### CLI Flag Reference
@@ -432,47 +470,6 @@ go build -ldflags="-s -w" -o bin/ib-train.exe ./cmd/ib-train
 | **`-lr`** | `0.005` | `0.0001 – 0.05` | AdamW learning rate. Default `0.005` provides fast, stable convergence. |
 | **`-vocab`** | `250` | `100 – 2000` | Target BPE subword vocabulary size. 250 is optimal for 3–10 classes. |
 | **`-seed`** | `42` | Any `int64` | Random seed for deterministic train/validation split and initialization. |
-
-#### 2. Method B: Programmatic Training via Go Code
-
-Train and export binary weights directly inside your Go application without external processes:
-
-```go
-package main
-
-import (
-	"log"
-
-	"intellibranch/pkg/intellibranch"
-)
-
-func main() {
-	// 1. Load samples from CSV
-	samples, err := intellibranch.LoadDatasetCSV("data/support_intents.csv")
-	if err != nil {
-		log.Fatalf("Dataset load error: %v", err)
-	}
-
-	// 2. Configure training hyperparameters
-	config := intellibranch.DefaultTrainConfig()
-	config.Epochs = 50
-	config.LearningRate = 0.005
-	config.VocabSize = 250
-
-	// 3. Execute BPE + AdamW training pipeline
-	model, err := intellibranch.TrainModel(samples, config)
-	if err != nil {
-		log.Fatalf("Training failed: %v", err)
-	}
-
-	// 4. Serialize to Little-Endian binary with SHA-256 integrity hash
-	if err := intellibranch.SaveToFile(model, "weights/support.bin"); err != nil {
-		log.Fatalf("Model export failed: %v", err)
-	}
-
-	log.Println("Model successfully trained and saved!")
-}
-```
 
 #### 3. Training Pipeline Architecture & Phases
 
@@ -522,7 +519,7 @@ import (
 	"net/http"
 	"time"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 type RequestPayload struct {
@@ -539,9 +536,9 @@ type ResponsePayload struct {
 
 func main() {
 	// 1. Initialize Router with a 0.60 calibrated confidence threshold
-	router, err := intellibranch.NewRouter("weights/support.bin", 0.60)
+	router, err := neurogate.NewRouter("weights/support.bin", 0.60)
 	if err != nil {
-		log.Fatalf("Failed to initialize IntelliBranch: %v", err)
+		log.Fatalf("Failed to initialize NeuroGate: %v", err)
 	}
 
 	// 2. Bind business domain handlers
@@ -594,7 +591,7 @@ func main() {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	log.Println("IntelliBranch HTTP Router listening on :8080...")
+	log.Println("NeuroGate HTTP Router listening on :8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 ```
@@ -631,10 +628,10 @@ package main
 import (
 	"log"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
-func HotReloadService(router *intellibranch.Router, newWeightPath string) {
+func HotReloadService(router *neurogate.Router, newWeightPath string) {
 	// Atomically reloads weights and validates format v2 with zero downtime
 	if err := router.Reload(newWeightPath); err != nil {
 		log.Printf("Hot reload failed: %v", err)
@@ -670,7 +667,7 @@ for _, ev := range events {
 
 // 3. Or inspect single diagnostic trace
 trace := router.Inspect(userMessage)
-slog.Info("IntelliBranch dispatch complete",
+slog.Info("NeuroGate dispatch complete",
 	"query", trace.InputText,
 	"selected_branch", trace.PredictedLabel,
 	"confidence", trace.Confidence,
@@ -687,7 +684,7 @@ slog.Info("IntelliBranch dispatch complete",
 
 ### 5.4. Semantic LLM Gateway & Cloud Bypass
 
-Slash external Cloud LLM (OpenAI/Claude) costs by 80–90% and eliminate 1,000+ ms latency by resolving routine user queries with IntelliBranch in 6 μs:
+Slash external Cloud LLM (OpenAI/Claude) costs by 80–90% and eliminate 1,000+ ms latency by resolving routine user queries with NeuroGate in 6 μs:
 
 ```go
 package main
@@ -697,16 +694,16 @@ import (
 	"fmt"
 	"log"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 type LLMBypassGateway struct {
-	router *intellibranch.Router
+	router *neurogate.Router
 }
 
 func NewLLMBypassGateway(weightsPath string) (*LLMBypassGateway, error) {
 	// Initialize with 0.65 threshold to ensure high precision before local execution
-	r, err := intellibranch.NewRouter(weightsPath, 0.65)
+	r, err := neurogate.NewRouter(weightsPath, 0.65)
 	if err != nil {
 		return nil, err
 	}
@@ -748,12 +745,12 @@ import (
 	"context"
 	"fmt"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 type CascadingServiceRouter struct {
-	domainRouter *intellibranch.Router
-	subRouters   map[string]*intellibranch.Router
+	domainRouter *neurogate.Router
+	subRouters   map[string]*neurogate.Router
 }
 
 func (c *CascadingServiceRouter) Dispatch(ctx context.Context, input string, payload any) error {
@@ -787,10 +784,10 @@ import (
 	"context"
 	"fmt"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
-func DispatchWithMetadata(ctx context.Context, router *intellibranch.Router, role, path, query string, payload any) error {
+func DispatchWithMetadata(ctx context.Context, router *neurogate.Router, role, path, query string, payload any) error {
 	// BPE tokenizes bracketed tags into distinct subword coordinates.
 	// GELU hidden layers evaluate non-linear interaction between identity and intent.
 	synthesizedInput := fmt.Sprintf("[%s][%s] %s", role, path, query)
@@ -804,11 +801,11 @@ func DispatchWithMetadata(ctx context.Context, router *intellibranch.Router, rol
 
 ## 6. Low-Level Go Runtime Internals (For Systems Architects)
 
-For systems engineers, infrastructure architects, and high-frequency Go practitioners, this section documents the exact memory layout, escape analysis mechanics, and concurrency semantics of IntelliBranch.
+For systems engineers, infrastructure architects, and high-frequency Go practitioners, this section documents the exact memory layout, escape analysis mechanics, and concurrency semantics of NeuroGate.
 
 ### 6.1. Memory Allocation & Escape Analysis Breakdown (Zero Allocations: 0 B/op)
 
-IntelliBranch provides two inference execution modes:
+NeuroGate provides two inference execution modes:
 
 ```bash
 # 1. Standard Forward: Single 24-byte slice header escape
@@ -820,7 +817,7 @@ BenchmarkPredictSlots-12    39564          29.91 μs/op           0 B/op        
 ```
 
 #### How is 0 B/op (Zero Allocations) Achieved?
-In `pkg/intellibranch/runtime.go`, `PredictSlots` bypasses dynamic heap allocation completely by writing directly into a caller-provided stack struct:
+In `pkg/neurogate/runtime.go`, `PredictSlots` bypasses dynamic heap allocation completely by writing directly into a caller-provided stack struct:
 
 ```go
 type MatchSlot struct {
@@ -856,13 +853,13 @@ func (m *InferenceModel) PredictSlots(text string, out *StaticInferenceResult) e
 ```
 
 - **Escape Analysis**: Because `StaticInferenceResult` is passed by pointer to a stack-local struct and its fields are populated without escaping, the Go compiler keeps memory strictly on the goroutine stack.
-- **Zero GC Pressure**: By eliminating heap allocations, IntelliBranch produces **zero garbage collection pauses**, guaranteeing deterministic P99 latency even under millions of queries per second.
+- **Zero GC Pressure**: By eliminating heap allocations, NeuroGate produces **zero garbage collection pauses**, guaranteeing deterministic P99 latency even under millions of queries per second.
 
 ---
 
 ### 6.2. Lock-Free Read Path & Concurrency Guarantees
 
-In high-throughput microservices, lock contention on hot routing paths degrades latency percentiles (P99/P999). IntelliBranch implements an asymmetric concurrency design:
+In high-throughput microservices, lock contention on hot routing paths degrades latency percentiles (P99/P999). NeuroGate implements an asymmetric concurrency design:
 
 1. **Immutable Model Core (`InferenceModel`)**:
    - `Weights` (Embedding, W1, B1, W2, B2) are loaded once at startup into read-only contiguous memory slices.
@@ -878,7 +875,7 @@ In high-throughput microservices, lock contention on hot routing paths degrades 
 
 ### 6.3. IBRN Binary Wire Format Specification
 
-IntelliBranch models are compiled into a custom, compact Little-Endian binary (`.bin`) with zero external container dependencies (no Protobuf, no FlatBuffers, no JSON).
+NeuroGate models are compiled into a custom, compact Little-Endian binary (`.bin`) with zero external container dependencies (no Protobuf, no FlatBuffers, no JSON).
 
 ```text
 +-------------------------------------------------------------------------------+
@@ -928,13 +925,13 @@ type BadWeights struct {
     W1 [][]float32 // Each row is an independent heap allocation
 }
 
-// ✅ INTELLIBRANCH IMPLEMENTATION: Contiguous flat 1D slice
+// ✅ NEUROGATE IMPLEMENTATION: Contiguous flat 1D slice
 type Weights struct {
     W1 []float32 // Exactly 1 contiguous block of [EmbeddingDim * HiddenDim]
 }
 ```
 
-In `pkg/intellibranch/ops.go`:
+In `pkg/neurogate/ops.go`:
 
 ```go
 func MatMulVecAdd(vec, mat, bias []float32, inDim, outDim int, out []float32) error {
@@ -957,11 +954,11 @@ func MatMulVecAdd(vec, mat, bias []float32, inDim, outDim int, out []float32) er
 
 ## 7. Go Beginner's Survival Guide & Safe Patterns
 
-If you are new to Go, you do not need to understand linear algebra or vector calculus. Think of IntelliBranch as an **intelligent, fuzzy `switch` statement that never crashes on typos**.
+If you are new to Go, you do not need to understand linear algebra or vector calculus. Think of NeuroGate as an **intelligent, fuzzy `switch` statement that never crashes on typos**.
 
 ### 7.1. Mental Syntax Mapping: `switch` vs `Router`
 
-| Standard Go Construct | IntelliBranch Construct | What It Does |
+| Standard Go Construct | NeuroGate Construct | What It Does |
 | :--- | :--- | :--- |
 | `switch input {` | `router, _ := NewRouter("weights.bin", 0.60)` | Initializes the branching engine with a 60% confidence baseline. |
 | `case "Refund":` | `.Bind("Refund", func(...) error { ... })` | Registers the function to run when the query means "Refund". |
@@ -981,7 +978,7 @@ default:
     return handleUnknown()
 }
 
-// ✅ INTELLIBRANCH: Handles typos, slang, and novel phrasing seamlessly
+// ✅ NEUROGATE: Handles typos, slang, and novel phrasing seamlessly
 router.
     Bind("Refund", func(ctx context.Context, payload any) error {
         return processRefund()
@@ -1046,13 +1043,13 @@ import (
 	"fmt"
 	"log"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 func main() {
 	// 1. Load the trained model weights
 	// (Ensure weights/intent.bin exists by running `ib-train` first)
-	router, err := intellibranch.NewRouter("weights/intent.bin", 0.60)
+	router, err := neurogate.NewRouter("weights/intent.bin", 0.60)
 	if err != nil {
 		log.Fatalf("Failed to load router: %v (Did you train the model first?)", err)
 	}
@@ -1131,11 +1128,11 @@ import (
 	"context"
 	"log"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 type KafkaQoSDispatcher struct {
-	router *intellibranch.Router
+	router *neurogate.Router
 }
 
 func (k *KafkaQoSDispatcher) ProcessMessage(ctx context.Context, rawLog string, offset int64) {
@@ -1144,7 +1141,7 @@ func (k *KafkaQoSDispatcher) ProcessMessage(ctx context.Context, rawLog string, 
 }
 
 func SetupKafkaQoSRouter() (*KafkaQoSDispatcher, error) {
-	r, err := intellibranch.NewRouter("weights/qos.bin", 0.60)
+	r, err := neurogate.NewRouter("weights/qos.bin", 0.60)
 	if err != nil {
 		return nil, err
 	}
@@ -1194,11 +1191,11 @@ import (
 	"context"
 	"fmt"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 type HardwareController struct {
-	router *intellibranch.Router
+	router *neurogate.Router
 }
 
 func (h *HardwareController) ExecuteCommand(ctx context.Context, spokenText string) {
@@ -1207,7 +1204,7 @@ func (h *HardwareController) ExecuteCommand(ctx context.Context, spokenText stri
 }
 
 func SetupHardwareRouter() (*HardwareController, error) {
-	r, err := intellibranch.NewRouter("weights/appliance.bin", 0.65)
+	r, err := neurogate.NewRouter("weights/appliance.bin", 0.65)
 	if err != nil {
 		return nil, err
 	}
@@ -1256,11 +1253,11 @@ import (
 	"context"
 	"log"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 type BuildFailureWebhook struct {
-	router *intellibranch.Router
+	router *neurogate.Router
 }
 
 func (b *BuildFailureWebhook) OnJobFailed(ctx context.Context, jobID string, errorTail string) {
@@ -1269,7 +1266,7 @@ func (b *BuildFailureWebhook) OnJobFailed(ctx context.Context, jobID string, err
 }
 
 func SetupCICDRouter() (*BuildFailureWebhook, error) {
-	r, err := intellibranch.NewRouter("weights/cicd.bin", 0.65)
+	r, err := neurogate.NewRouter("weights/cicd.bin", 0.65)
 	if err != nil {
 		return nil, err
 	}
@@ -1319,11 +1316,11 @@ import (
 	"context"
 	"fmt"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 type CoreBankingGateway struct {
-	router *intellibranch.Router
+	router *neurogate.Router
 }
 
 func (c *CoreBankingGateway) RouteWirePacket(ctx context.Context, packetString string, sessionID string) error {
@@ -1332,7 +1329,7 @@ func (c *CoreBankingGateway) RouteWirePacket(ctx context.Context, packetString s
 }
 
 func SetupBankingRouter() (*CoreBankingGateway, error) {
-	r, err := intellibranch.NewRouter("weights/banking.bin", 0.70)
+	r, err := neurogate.NewRouter("weights/banking.bin", 0.70)
 	if err != nil {
 		return nil, err
 	}
@@ -1365,11 +1362,11 @@ func SetupBankingRouter() (*CoreBankingGateway, error) {
 
 Traditional programming constructs (`if`, `switch`, `hash map`, `regex`) were conceived for discrete, exact-byte matching. When applied to real-world language, colloquial variants, or high-volume unstructured logs, **they suffer structural collapse**. 
 
-IntelliBranch replaces discrete string comparison with **continuous vector-coordinate routing in ~30 μs**. The bundled demonstration driver (`cmd/ib-demo`) proves this superiority across 6 isolated enterprise domains:
+NeuroGate replaces discrete string comparison with **continuous vector-coordinate routing in ~30 μs**. The multi-task demonstration driver (`ib-demo`) in the companion **[NeuroGate - demo](../../NeuroGate%20-%20demo)** project proves this superiority across 6 isolated enterprise domains:
 
-### 9.1. Architectural Showdown: Retro Branching Collapse vs. IntelliBranch
+### 9.1. Architectural Showdown: Retro Branching Collapse vs. NeuroGate
 
-| Domain | Why Traditional Branching (`if`, `switch`, `map`, `regex`) Collapses | How IntelliBranch Proves Architectural Dominance |
+| Domain | Why Traditional Branching (`if`, `switch`, `map`, `regex`) Collapses | How NeuroGate Proves Architectural Dominance |
 | :--- | :--- | :--- |
 | **1. E-Commerce CS Gateway** | `strings.Contains` collapses opposite intents (`"refund delivery"` vs `"delivery refund"`). Regex rules explode to $O(N!)$ permutations. | Learned Positional Embeddings ($P_{32 \times 64}$) disambiguate token order. `DispatchPipeline` chains multi-intent actions cleanly. |
 | **2. Semantic LLM Gateway** | Exact-key hash maps (`map[string]T`) have 0% hit rate on natural queries, wasting $0.02 and 1.5s per routine request on cloud LLMs. | Resolves routine commands locally in **30 μs at $0.00**. Shannon Entropy ($> 1.80$) isolates true OOD queries to OpenAI GPT-4o. |
@@ -1378,34 +1375,31 @@ IntelliBranch replaces discrete string comparison with **continuous vector-coord
 | **5. Automated CI/CD Remediation**| Compiler error formatting fluctuates across toolchains, causing brittle regex matchers to silently fail and drop automated healing. | Ingests raw error tails and generalizes statistical subwords into deterministic remediation actions (`AutoRetry`, `ScaleUp`, `NotifyAuthor`). |
 | **6. FinTech Memo Fraud Audit** | Keyword blacklists are trivially bypassed by obfuscation (`"p0lice"`). Binary `if/else` creates false positives or fraud leakage. | 3-tier margin scoring triggers Step-Up 2FA (`Ambiguous`) when scam probability is borderline, introducing dynamic middle-ground control. |
 
-### 9.2. Compiling and Running the Driver (Zero-Download Auto-Training)
+### 9.2. Executing the Demonstration Driver in the Demo Project
 
-Because IntelliBranch forges its domain neural models directly from dataset CSVs without downloading third-party weights, **no manual weight downloads are necessary**. When `ib-demo` runs, it detects missing binary models and auto-trains them in memory in under 2 seconds:
+The interactive driver and domain datasets are maintained in the companion **`NeuroGate - demo`** repository. When executed, it auto-trains all missing binary models on-the-fly in under 2 seconds:
 
 ```bash
-# Option 1: Direct instantaneous run via Go CLI
-go run ./cmd/ib-demo
-
-# Option 2: Compile a static standalone binary
-go build -ldflags="-s -w" -o bin/ib-demo.exe ./cmd/ib-demo
+# Navigate to companion demonstration project
+cd "../NeuroGate - demo"
 
 # Run all 6 domains sequentially in automated showcase mode
-./bin/ib-demo.exe -domain all
+go run ./cmd/ib-demo -domain all
 
 # Or inspect a specific enterprise domain
-./bin/ib-demo.exe -domain cs       # E-Commerce CS Gateway (XOR & Multi-Intent Pipeline)
-./bin/ib-demo.exe -domain llm      # Semantic LLM Gateway & Cloud Bypass ($0.00 vs $0.02)
-./bin/ib-demo.exe -domain sre      # High-Throughput SRE Log Triage (0 B/op via PredictSlots)
-./bin/ib-demo.exe -domain iot      # Offline Edge IoT Command Dispatcher
-./bin/ib-demo.exe -domain cicd     # Automated CI/CD Failure Triage & Self-Healing
-./bin/ib-demo.exe -domain fintech  # FinTech Transaction Memo Audit & 2FA Challenge
+go run ./cmd/ib-demo -domain cs       # E-Commerce CS Gateway (XOR & Multi-Intent Pipeline)
+go run ./cmd/ib-demo -domain llm      # Semantic LLM Gateway & Cloud Bypass ($0.00 vs $0.02)
+go run ./cmd/ib-demo -domain sre      # High-Throughput SRE Log Triage (0 B/op via PredictSlots)
+go run ./cmd/ib-demo -domain iot      # Offline Edge IoT Command Dispatcher
+go run ./cmd/ib-demo -domain cicd     # Automated CI/CD Failure Triage & Self-Healing
+go run ./cmd/ib-demo -domain fintech  # FinTech Transaction Memo Audit & 2FA Challenge
 ```
 
 ### 9.3. Sample Output
 
 ```text
 ================================================================================
-      INTELLIBRANCH v2.0 - 6-DOMAIN MULTI-TASK DEMONSTRATION SUITE
+      NEUROGATE v2.0 - 6-DOMAIN MULTI-TASK DEMONSTRATION SUITE
 ================================================================================
 
 >>> DOMAIN: 3. High-Throughput SRE Log Triage (Zero Allocation: 0 B/op)
@@ -1448,7 +1442,7 @@ Control flow must transcend discrete, byte-exact binary matching. It must evolve
 2. Control flow must natively understand semantic context, token permutation, and feature interactions in single-digit microseconds.
 3. Decision boundaries must be probabilistic and multi-tiered—safely executing confident branches, gracefully prompting when ambiguous, and deterministically isolating out-of-distribution noise without panic.
 
-**IntelliBranch is not just a tool; it is a working manifesto.** It proves that a self-contained, domain-trained neural routing engine running in pure Go can replace brittle retro branching at **~30 microseconds with strictly 0 B/op heap allocation**.
+**NeuroGate is not just a tool; it is a working manifesto.** It proves that a self-contained, domain-trained neural routing engine running in pure Go can replace brittle retro branching at **~30 microseconds with strictly 0 B/op heap allocation**.
 
 The future of programming languages lies in elevating the compiler and runtime to understand continuous semantic topology. The era of blind discrete branching is over.
 

@@ -1,4 +1,4 @@
-package intellibranch
+package neurogate
 
 import (
 	"context"
@@ -173,6 +173,12 @@ func (r *Router) Bind(label string, action RouteAction) *Router {
 	r.routes[label] = action
 	return r
 }
+
+// Branch is an alias for Bind, providing a semantic and intuitive syntax for registering intelligent branches.
+func (r *Router) Branch(label string, action RouteAction) *Router {
+	return r.Bind(label, action)
+}
+
 
 // BindPipeline registers a specific multi-intent pipeline handler for a primary and secondary label pair.
 func (r *Router) BindPipeline(primary string, secondary string, action PipelineAction) *Router {

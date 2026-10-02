@@ -1,4 +1,4 @@
-package intellibranch
+package neurogate
 
 import (
 	"sync"

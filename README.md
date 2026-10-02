@@ -1,4 +1,4 @@
-# IntelliBranch
+# NeuroGate
 <img src="https://github.com/user-attachments/assets/3413a486-d71c-4285-841d-76bbe74f830a" width="226" height="200" alt="Image" align="right" style="margin-left: 15px; margin: 10px;">
 <p align="center">
   <strong>Directly Creates and Runs Its Own Neural AI in Pure Go</strong><br>
@@ -20,9 +20,9 @@
 
 ---
 
-## What is IntelliBranch?
+## What is NeuroGate?
 
-**IntelliBranch does NOT borrow, lease, or download external AI models. This engine directly creates and runs its own domain artificial intelligence from scratch.**
+**NeuroGate does NOT borrow, lease, or download external AI models. This engine directly creates and runs its own domain artificial intelligence from scratch.**
 
 Instead of relying on brittle regex matching or calling bloated external LLMs, it **manufactures a domain-specific lightweight neural network directly from your dataset in under 2 seconds**. It maps typos, slang, inverted syntax, and colloquial phrasing into a continuous latent vector space—routing execution flow directly to your bound Go functions in **microseconds (~30 μs) with strictly 0 B/op heap allocation**.
 
@@ -52,7 +52,7 @@ Incoming Request ("bruh can u refund order #49281")
 
 ---
 
-## Why IntelliBranch? (Beyond Retro Branching, Cloud LLMs, and Bloated Local Models)
+## Why NeuroGate? (Beyond Retro Branching, Cloud LLMs, and Bloated Local Models)
 
 Modern backends face an architectural dilemma when routing unstructured or noisy user requests:
 
@@ -74,7 +74,7 @@ if strings.Contains(input, "refund") || strings.Contains(input, "cancel") {
 // CPU Starvation: Burns 100% CPU across multiple cores, starving companion microservices
 // Deployment Complexity: Requires CGO, C++ shared libraries (libllama.so), or background daemons
 
-// ✅ INTELLIBRANCH: Self-Generated Micro-AI (In-Memory Go Engine)
+// ✅ NEUROGATE: Self-Generated Micro-AI (In-Memory Go Engine)
 // Memory Footprint: Under 180 KB (25,000x smaller than quantized 7B models)
 // Latency: ~30 μs with 0 B/op (0 allocs) and deterministic 3-tier fallback
 // Deployment: 100% Pure Go with CGO_ENABLED=0 single static binary
@@ -82,7 +82,7 @@ if strings.Contains(input, "refund") || strings.Contains(input, "cancel") {
 
 ### Architectural Comparison Matrix
 
-| Capability | Retro Branching (`if` / Regex) | Cloud LLMs (OpenAI / Claude) | Local LLMs (Ollama / llama.cpp) | **IntelliBranch v2.0 (Embedded Engine)** |
+| Capability | Retro Branching (`if` / Regex) | Cloud LLMs (OpenAI / Claude) | Local LLMs (Ollama / llama.cpp) | **NeuroGate v2.0 (Embedded Engine)** |
 | :--- | :--- | :--- | :--- | :--- |
 | **Inference Latency** | < 1 μs | 300 ms – 2,500 ms (Network bound) | 30 ms – 300 ms (Compute bound) | **~30 μs (In-Memory)** |
 | **Throughput (per core)** | > 500,000 req/sec | ~50 req/sec (Rate limited) | ~20–50 req/sec (CPU saturated) | **> 33,000 req/sec (Zero Alloc)** |
@@ -99,7 +99,7 @@ if strings.Contains(input, "refund") || strings.Contains(input, "cancel") {
 
 ## Key Highlights
 
-- **Zero Downloads & On-The-Fly AI Creation**: You never download gigabytes of pre-trained weights from HuggingFace or lease external APIs. IntelliBranch forges a domain neural AI model directly from your CSV in under 2 seconds.
+- **Zero Downloads & On-The-Fly AI Creation**: You never download gigabytes of pre-trained weights from HuggingFace or lease external APIs. NeuroGate forges a domain neural AI model directly from your CSV in under 2 seconds.
 - **Zero Allocations on Hot Path (`0 B/op`)**: `PredictSlots` executes inference without triggering GC pressure, returning zero-heap stack results.
 - **Semantic XOR & Word Order Disambiguation**: Format v2 embeds 32 positional vectors coupled with non-linear $GELU(E_i + P_i)$ pooling, mathematically distinguishing permutations like `"delivery refund"` from `"refund delivery"`.
 - **3-Tier Decision Pipeline**: Classifies predictions into **Definite** (High confidence), **Ambiguous** (Borderline/narrow margin), or **Fallback** (Out-of-Distribution / High Shannon Entropy).
@@ -121,9 +121,17 @@ Benchmarked on an AMD Ryzen 5 5600H (12 threads) running pure Go standard runtim
 
 ---
 
+## Installation
+
+```bash
+go get github.com/gluedays-cyber/neurogate
+```
+
+---
+
 ## 3-Step Lifecycle
 
-### Step 1: AI Design — Prepare Your Domain Knowledge (`data/sample_dataset.csv`)
+### Step 1: AI Design — Prepare Your Domain Knowledge (`train.csv`)
 Create a clean two-column CSV containing natural user queries and corresponding target labels:
 
 ```csv
@@ -136,19 +144,48 @@ yo i typed the wrong apt number please update address,Delivery
 locked out of my account after 3 tries help pls,Account
 ```
 
-### Step 2: Build Your Own AI — Compile Model Weights (`ib-train.exe`)
-Train your domain vocabulary and neural weights into a compact Little-Endian binary (`intent.bin`) using the standalone CLI:
+### Step 2: Build Your Own AI — Programmatic In-Memory Compilation
+Train your domain vocabulary and neural weights directly from Go code without external CLI tools:
 
-```bash
-# Build the training tool once
-go build -ldflags="-s -w" -o bin/ib-train.exe ./cmd/ib-train
+```go
+package main
 
-# Compile 1,000+ domain rows in under 2 seconds (creates format v2 with positional embeddings)
-./bin/ib-train.exe -data data/sample_dataset.csv -out weights/intent.bin -epochs 50 -lr 0.005 -vocab 250
+import (
+	"log"
+
+	"github.com/gluedays-cyber/neurogate"
+)
+
+func main() {
+	// Load training samples from dataset
+	samples, err := neurogate.LoadCSVDataset("data/train.csv")
+	if err != nil {
+		log.Fatalf("Failed to load dataset: %v", err)
+	}
+
+	// Configure hyperparameters
+	cfg := neurogate.DefaultTrainConfig()
+	cfg.Epochs = 50
+	cfg.LearningRate = 0.005
+	cfg.TargetVocabSize = 250
+
+	// Compile Little-Endian neural model in ~1.5s
+	model, err := neurogate.TrainModel(samples, cfg)
+	if err != nil {
+		log.Fatalf("Training failed: %v", err)
+	}
+
+	// Persist binary weights
+	if err := neurogate.SaveBinaryModel("weights/model.bin", model); err != nil {
+		log.Fatalf("Failed to save model: %v", err)
+	}
+	log.Println("Model compiled successfully.")
+}
 ```
+*(Note: A standalone CLI compiler `ib-train` is provided in the companion [NeuroGate - demo](../NeuroGate%20-%20demo) project).*
 
-### Step 3: AI-Powered Branching — Run In-Memory Routing (`go run main.go`)
-Execute zero-config server routing directly. If model weights are not found, `main.go` automatically compiles them from `data/sample_dataset.csv` in under 2 seconds:
+### Step 3: AI-Powered Branching — High-Level Routing Engine
+Initialize the router using the high-level `OpenOrTrain` API (or `Open` if weights already exist), bind domain handlers, and execute microsecond routing:
 
 ```go
 package main
@@ -157,9 +194,8 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 
-	"intellibranch/pkg/intellibranch"
+	"github.com/gluedays-cyber/neurogate"
 )
 
 // 1. Business Logic Handlers
@@ -184,45 +220,23 @@ func handleFallback(ctx context.Context, payload any) error {
 }
 
 func main() {
-	modelPath := "weights/intent.bin"
+	modelPath := "weights/model.bin"
+	dataPath := "data/train.csv"
 
-	// Auto-compile model if missing (ensures instant zero-config clone & run)
-	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
-		log.Println("Model weights not found. Compiling from data/sample_dataset.csv...")
-		samples, err := intellibranch.LoadCSVDataset("data/sample_dataset.csv")
-		if err != nil {
-			log.Fatalf("Failed to load dataset: %v", err)
-		}
-		cfg := intellibranch.DefaultTrainConfig()
-		cfg.Epochs = 50
-		cfg.LearningRate = 0.005
-		cfg.TargetVocabSize = 250
-
-		model, err := intellibranch.TrainModel(samples, cfg)
-		if err != nil {
-			log.Fatalf("Training failed: %v", err)
-		}
-		_ = os.MkdirAll("weights", 0755)
-		if err := intellibranch.SaveBinaryModel(modelPath, model); err != nil {
-			log.Fatalf("Failed to save model: %v", err)
-		}
-		log.Println("Model compilation completed.")
-	}
-
-	// 2. Load compiled binary weights into memory (0.60 calibrated threshold)
-	router, err := intellibranch.NewRouter(modelPath, 0.60)
+	// 1. Zero-boilerplate library API: Train or load compiled weights
+	router, err := neurogate.OpenOrTrain(dataPath, modelPath, 0.60)
 	if err != nil {
-		log.Fatalf("Router initialization failed: %v", err)
+		log.Fatalf("NeuroGate engine initialization failed: %v", err)
 	}
 
-	// 3. Bind routes directly inside main.go
+	// 2. Bind intelligent branches
 	router.
-		Bind("Refund", handleRefund).
-		Bind("Delivery", handleDelivery).
-		Bind("Account", handleAccount).
+		Branch("Refund", handleRefund).
+		Branch("Delivery", handleDelivery).
+		Branch("Account", handleAccount).
 		Fallback(handleFallback)
 
-	// 4. Execute microsecond branch dispatch
+	// 3. Execute microsecond branch dispatch
 	testQueries := []string{
 		"I want to cancel my payment and request a refund",
 		"When will my delivery package arrive",
@@ -232,7 +246,7 @@ func main() {
 		"Completely random gibberish noise 12345!@#$",
 	}
 
-	fmt.Println("=== IntelliBranch Server Routing Started ===")
+	fmt.Println("=== NeuroGate Server Routing Started ===")
 	ctx := context.Background()
 	for _, query := range testQueries {
 		if err := router.Dispatch(ctx, query, query); err != nil {
@@ -248,7 +262,7 @@ For mission-critical production services requiring 3-tier calibration, composite
 
 ```go
 // 1. Configure 3-Tier Policy and Active Learning Telemetry Buffer
-router.SetPolicy(intellibranch.DispatchPolicy{
+router.SetPolicy(neurogate.DispatchPolicy{
 	HighThreshold:     0.75,
 	LowThreshold:      0.40,
 	MarginCutoff:      0.15,
@@ -368,18 +382,18 @@ import (
 	"fmt"
 	"log"
 
-	"intellibranch/pkg/intellibranch"
+	"neurogate/pkg/neurogate"
 )
 
 func main() {
 	// 1. Initialize NeuroGate from binary model
-	gate, err := intellibranch.NewNeuroGate("weights/demo_iot.bin")
+	gate, err := neurogate.NewNeuroGate("weights/demo_iot.bin")
 	if err != nil {
 		log.Fatalf("NeuroGate init failed: %v", err)
 	}
 
 	// 2. Calibrate domain manifold centroid from training samples
-	if samples, err := intellibranch.LoadCSVDataset("data/demo_iot.csv"); err == nil {
+	if samples, err := neurogate.LoadCSVDataset("data/demo_iot.csv"); err == nil {
 		gate.CalibrateDomainCentroid(samples)
 	}
 
@@ -407,17 +421,17 @@ func main() {
 
 ---
 
-## The Evolution of Control Flow: Why Retro Branching Fails & How IntelliBranch Proves Its Architectural Superiority
+## The Evolution of Control Flow: Why Retro Branching Fails & How NeuroGate Proves Its Architectural Superiority
 
 Traditional programming languages force engineers into **discrete control flow** (`if`, `switch`, `hash map`, `regex`). These constructs were invented in the 1960s for deterministic, byte-exact hardware primitives. When applied to real-world strings, natural language, unstructured logs, or conversational commands, **they collapse entirely**.
 
-IntelliBranch transforms control flow from brittle discrete matching into **continuous geometric vector-space routing ($text \to action$) in ~30 μs**.
+NeuroGate transforms control flow from brittle discrete matching into **continuous geometric vector-space routing ($text \to action$) in ~30 μs**.
 
-The included multi-task demonstration driver (`cmd/ib-demo`) directly pits IntelliBranch against traditional programming primitives across 6 critical enterprise domains:
+The included multi-task demonstration driver (`cmd/ib-demo`) directly pits NeuroGate against traditional programming primitives across 6 critical enterprise domains:
 
-### 1. Structural Comparison: Retro Branching vs. IntelliBranch
+### 1. Structural Comparison: Retro Branching vs. NeuroGate
 
-| Control Flow Primitive | Why It Breaks Down on Real-World Input | How IntelliBranch Resolves It Permanently |
+| Control Flow Primitive | Why It Breaks Down on Real-World Input | How NeuroGate Resolves It Permanently |
 | :--- | :--- | :--- |
 | **`switch` / `if (str == val)`** | **100% Failure on Variations**: A 1-character typo (`"refnd"`), colloquial phrasing (`"gimme my cash back"`), or extra whitespace causes silent fall-through. | **BPE Continuous Embedding**: Maps all semantic synonyms and misspelled subwords to contiguous vector coordinates in 64-D space. |
 | **Hash Maps (`map[string]T`)** | **Exact-Key Blindness**: Cannot index semantic equivalence. Caching 10,000 phrasing variations requires 10,000 distinct hash keys, leading to memory bloat and constant cache misses. | **Semantic Coordinate Resolution**: Resolves infinite sentence variations into deterministic Go handlers in ~30 μs with zero external network overhead. |
@@ -427,65 +441,54 @@ The included multi-task demonstration driver (`cmd/ib-demo`) directly pits Intel
 
 ---
 
-### 2. 6-Domain Deep-Dive: Proving Superiority in Action (`ib-demo`)
+### 2. 6 Enterprise Domains: Proven Architectural Superiority
 
-The automated demonstration driver (`ib-demo`) proves these architectural advantages live across 6 isolated models:
+The companion demonstration project ([NeuroGate - demo](../NeuroGate%20-%20demo)) proves these architectural advantages live across 6 isolated production models:
 
 #### Domain 1: E-Commerce CS Gateway (Defeating the Semantic XOR Dilemma)
 - **The Retro Collapse**: `if strings.Contains(msg, "refund") && strings.Contains(msg, "delivery")` collapses opposite business intents. Both `"refund delivery fee"` and `"delivery instead of refund"` trigger the same branch. Regex permutations explode exponentially.
-- **The IntelliBranch Victory**: Learned positional vectors ($P_i$) coupled with non-linear $GELU(E_i + P_i)$ pooling mathematically separate token permutations. Furthermore, `DispatchPipeline` automatically executes composite operations (e.g. Return Approved $\to$ Reshipment Initiated) when both primary and secondary confidences qualify.
-- **Run Live**: `./bin/ib-demo.exe -domain cs`
+- **The NeuroGate Victory**: Learned positional vectors ($P_i$) coupled with non-linear $GELU(E_i + P_i)$ pooling mathematically separate token permutations. Furthermore, `DispatchPipeline` automatically executes composite operations (e.g. Return Approved $\to$ Reshipment Initiated) when both primary and secondary confidences qualify.
 
 #### Domain 2: Semantic LLM Gateway (Defeating Hash Map Key Misses & API Waste)
 - **The Retro Collapse**: Caching natural language with `map[string]Handler` achieves a near 0% hit rate because users never type the exact same string twice. Consequently, backends route 100% of routine traffic to OpenAI/Claude, burning $0.02–$0.05 and 1,500ms per request.
-- **The IntelliBranch Victory**: Maps routine banking commands (`QueryBalance`, `TransferFunds`, `CardLock`) directly to in-memory Go handlers in **30 μs at $0.00 cost**. Out-of-Distribution (OOD) queries (e.g. `"explain quantum physics"`) are detected via high Shannon Entropy ($> 1.80$) and safely escalated to cloud LLMs.
-- **Run Live**: `./bin/ib-demo.exe -domain llm`
+- **The NeuroGate Victory**: Maps routine banking commands (`QueryBalance`, `TransferFunds`, `CardLock`) directly to in-memory Go handlers in **30 μs at $0.00 cost**. Out-of-Distribution (OOD) queries (e.g. `"explain quantum physics"`) are detected via high Shannon Entropy ($> 1.80$) and safely escalated to cloud LLMs.
 
 #### Domain 3: High-Throughput SRE Log Triage (Defeating ReDoS & GC Pauses with 0 B/op)
 - **The Retro Collapse**: Ingesting 100,000+ log lines/sec through complex regex engines burns 100% CPU due to catastrophic backtracking. String allocations trigger GC stop-the-world pauses, choking message brokers (Kafka, Vector).
-- **The IntelliBranch Victory**: Executes stack-allocated zero-heap inference (`PredictSlots`) with **strictly 0 B/op and 0 allocs/op**. Instantly routes critical P0 panics (OOMKilled) to autoscalers while shunting low-priority health probes without heap garbage.
-- **Run Live**: `./bin/ib-demo.exe -domain sre`
+- **The NeuroGate Victory**: Executes stack-allocated zero-heap inference (`PredictSlots`) with **strictly 0 B/op and 0 allocs/op**. Instantly routes critical P0 panics (OOMKilled) to autoscalers while shunting low-priority health probes without heap garbage.
 
 #### Domain 4: Offline Edge IoT Control (Defeating Brittle Keyword Matching in <180KB RAM)
 - **The Retro Collapse**: Hard-coded `switch(cmd)` fails when users speak naturally: `"it's freezing in here"` fails to trigger `"turn on heater"`. Running local 7B models requires 4GB+ RAM, impossible on 64MB embedded Linux boards.
-- **The IntelliBranch Victory**: Compiles into a single Little-Endian binary under 180 KB with zero external dependencies and zero CGO. Maps colloquial voice/text variants directly to hardware GPIO/UART actuators in single-digit microseconds.
-- **Run Live**: `./bin/ib-demo.exe -domain iot`
+- **The NeuroGate Victory**: Compiles into a single Little-Endian binary under 180 KB with zero external dependencies and zero CGO. Maps colloquial voice/text variants directly to hardware GPIO/UART actuators in single-digit microseconds.
 
 #### Domain 5: Automated CI/CD Failure Triage (Defeating Fragile String Scrapers)
 - **The Retro Collapse**: Compiler error messages change formatting across toolchains (Docker, Go, Gradle, Kubernetes). Hard-coded string pattern matching silently breaks, forcing DevOps engineers to manually triage build failures.
-- **The IntelliBranch Victory**: Ingests unstructured build error tails and generalizes statistical subwords to trigger deterministic self-healing actions: `AutoRetry` (transient network 504), `ScaleUp` (OOM kill status 137), or `NotifyAuthor` (code syntax error).
-- **Run Live**: `./bin/ib-demo.exe -domain cicd`
+- **The NeuroGate Victory**: Ingests unstructured build error tails and generalizes statistical subwords to trigger deterministic self-healing actions: `AutoRetry` (transient network 504), `ScaleUp` (OOM kill status 137), or `NotifyAuthor` (code syntax error).
 
 #### Domain 6: FinTech Transaction Memo Audit (Defeating Naive Blacklists with 3-Tier Safety)
 - **The Retro Collapse**: Keyword blacklists (`strings.Contains("scam")`) are trivially bypassed by fraudsters using typo obfuscation (`"p0lice f1ne"`). Rigid binary `if/else` either blocks legitimate transactions or lets fraud slip through.
-- **The IntelliBranch Victory**: Evaluates semantic risk. When the margin between normal transfer and scam suspicion is borderline (`isAmbiguous`), it intercepts execution to trigger Step-Up 2FA (SMS OTP challenge), providing a dynamic middle-ground impossible in standard boolean control flow.
-- **Run Live**: `./bin/ib-demo.exe -domain fintech`
+- **The NeuroGate Victory**: Evaluates semantic risk. When the margin between normal transfer and scam suspicion is borderline (`isAmbiguous`), it intercepts execution to trigger Step-Up 2FA (SMS OTP challenge), providing a dynamic middle-ground impossible in standard boolean control flow.
 
 ---
 
-### 3. Zero-Download On-The-Fly Demonstration Driver
+### 3. Companion Demonstration Project
 
-Because IntelliBranch manufactures its own neural models directly from dataset CSVs, **you do NOT need to download pre-trained weights from HuggingFace, Git LFS, or external buckets**. 
-
-When `ib-demo` is executed, its built-in auto-training bootstrap reads `data/demo_*.csv` and compiles all 6 Little-Endian binary models in memory in under 2 seconds:
+To inspect and execute live demonstrations of the 6 enterprise domains, clone or navigate to the companion **[NeuroGate - demo](../NeuroGate%20-%20demo)** repository:
 
 ```bash
-# Option 1: Instant direct run (auto-trains missing models and executes showcase)
-go run ./cmd/ib-demo
+# Navigate to companion demonstration project
+cd "../NeuroGate - demo"
 
-# Option 2: Compile static standalone binary
-go build -ldflags="-s -w" -o bin/ib-demo.exe ./cmd/ib-demo
+# Run all 6 domains (46 scenarios) in automated showcase mode
+go run ./cmd/ib-demo -domain all
 
-# Run all 6 domains sequentially in automated showcase mode
-./bin/ib-demo.exe -domain all
-
-# Or inspect an isolated domain to verify architectural superiority
-./bin/ib-demo.exe -domain cs       # Proves Semantic XOR order disambiguation
-./bin/ib-demo.exe -domain llm      # Proves Local $0.00 bypass vs Cloud LLM escape
-./bin/ib-demo.exe -domain sre      # Proves 0 B/op stack allocation on logs
-./bin/ib-demo.exe -domain iot      # Proves Sub-180KB offline colloquial control
-./bin/ib-demo.exe -domain cicd     # Proves Automated build failure self-healing
-./bin/ib-demo.exe -domain fintech  # Proves Borderline Step-Up 2FA Challenge
+# Or inspect individual enterprise domains
+go run ./cmd/ib-demo -domain cs       # 1. E-Commerce CS Gateway (XOR & Multi-Intent)
+go run ./cmd/ib-demo -domain llm      # 2. Semantic LLM Gateway & Cloud Bypass ($0.00 vs $0.02)
+go run ./cmd/ib-demo -domain sre      # 3. High-Throughput SRE Log Triage (0 B/op)
+go run ./cmd/ib-demo -domain iot      # 4. Offline Edge IoT Command Dispatcher
+go run ./cmd/ib-demo -domain cicd     # 5. Automated CI/CD Failure Triage & Self-Healing
+go run ./cmd/ib-demo -domain fintech  # 6. FinTech Transaction Memo Audit & Fraud Prevention
 ```
 
 ---
@@ -512,17 +515,11 @@ go build -ldflags="-s -w" -o bin/ib-demo.exe ./cmd/ib-demo
 ## Project Structure
 
 ```text
-intellibranch/
-├── bin/
-│   ├── ib-train.exe       # Compiled offline training tool
-│   └── ib-demo.exe        # Compiled 6-domain NeuroGate demonstration driver
-├── cmd/
-│   ├── ib-train/          # Offline BPE + AdamW training CLI source
-│   └── ib-demo/           # 6-Domain NeuroGate demonstration driver source
+NeuroGate - lib/
 ├── docs/
 │   └── MANUAL.md          # Comprehensive manual, keyword guide & tutorial
 ├── pkg/
-│   └── intellibranch/     # Pure-Go zero-dependency core engine
+│   └── neurogate/         # Pure-Go zero-dependency core engine
 │       ├── binary.go      # Format v1 & v2 Little-Endian parser and serializer
 │       ├── ops.go         # SafeClamp, GELU, Softmax, MatMul, and Non-Linear Pooling
 │       ├── runtime.go     # Zero-alloc PredictSlots, Shannon Entropy & In-memory model
@@ -530,44 +527,15 @@ intellibranch/
 │       ├── tokenizer.go   # Pure Go BPE subword tokenizer
 │       ├── trainer.go     # AdamW backprop trainer with positional embedding learning
 │       ├── router.go      # 3-Tier router, atomic reload, and pipeline dispatch
-│       └── neurogate.go   # 3-Head geometric filter, cosine manifold & symbolic anchors
-├── weights/
-│   ├── .gitkeep           # Directory placeholder (models compiled on-the-fly, git-ignored)
-│   └── (demo_*.bin)       # Auto-generated domain binary weights upon first demo run
-├── data/
-│   ├── sample_dataset.csv # 1,000+ domain training rows
-│   ├── demo_cs.csv        # 1,000 CS gateway intent samples (4 classes)
-│   ├── demo_llm.csv       # 1,000 banking LLM bypass samples (4 classes)
-│   ├── demo_sre.csv       # 1,000 high-throughput SRE log samples (4 classes)
-│   ├── demo_iot.csv       # 1,000 offline edge IoT voice samples (4 classes)
-│   ├── demo_cicd.csv      # 1,000 CI/CD build error remediation samples (4 classes)
-│   └── demo_fintech.csv   # 1,000 transaction memo fraud audit samples (4 classes)
-├── main.go                # Server entrypoint with auto-train bootstrap
-├── go.mod                 # Go module definition
+│       ├── neurogate.go   # 3-Head geometric filter, cosine manifold & symbolic anchors
+│       └── facade.go      # High-level zero-boilerplate APIs (Open, OpenOrTrain, Train)
+├── neurogate.go       # Root library export facade (import "neurogate")
+├── go.mod                 # Go module definition (pure library)
+├── LICENSE                # MIT License
 └── README.md              # Project documentation
 ```
 
----
-
-## 6-Domain Demonstration Driver (`ib-demo`)
-
-Run the 46-scenario multi-domain validation suite with automatic on-the-fly training:
-
-```bash
-# Run all 6 domains (46 scenarios) in automated showcase mode
-go run ./cmd/ib-demo -domain all
-
-# Or run via compiled standalone binary
-./bin/ib-demo.exe -domain all
-
-# Run individual enterprise domains
-./bin/ib-demo.exe -domain cs       # 1. E-Commerce CS Gateway (XOR & Multi-Intent)
-./bin/ib-demo.exe -domain llm      # 2. Semantic LLM Gateway & Cloud Bypass ($0.00 vs $0.02)
-./bin/ib-demo.exe -domain sre      # 3. High-Throughput SRE Log Triage (0 B/op)
-./bin/ib-demo.exe -domain iot      # 4. Offline Edge IoT Command Dispatcher
-./bin/ib-demo.exe -domain cicd     # 5. Automated CI/CD Failure Triage & Self-Healing
-./bin/ib-demo.exe -domain fintech  # 6. FinTech Transaction Memo Audit & Fraud Prevention
-```
+*(Note: Executable binaries, demonstration CLI tools, and datasets are hosted in the companion repository [NeuroGate - demo](../NeuroGate%20-%20demo)).*
 
 ---
 
@@ -598,7 +566,7 @@ Control flow must transcend discrete, byte-exact binary matching. It must evolve
 2. Control flow must natively understand semantic context, token permutation, and feature interactions in single-digit microseconds.
 3. Decision boundaries must be probabilistic and multi-tiered—safely executing confident branches, gracefully prompting when ambiguous, and deterministically isolating out-of-distribution noise without panic.
 
-**IntelliBranch is not just a tool; it is a working manifesto.** It proves that a self-contained, domain-trained neural routing engine running in pure Go can replace brittle retro branching at **~30 microseconds with strictly 0 B/op heap allocation**.
+**NeuroGate is not just a tool; it is a working manifesto.** It proves that a self-contained, domain-trained neural routing engine running in pure Go can replace brittle retro branching at **~30 microseconds with strictly 0 B/op heap allocation**.
 
 The future of programming languages lies in elevating the compiler and runtime to understand continuous semantic topology. The era of blind discrete branching is over.
 
