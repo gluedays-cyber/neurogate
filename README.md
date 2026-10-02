@@ -1,5 +1,5 @@
 ﻿# NeuroGate
-<img src="https://github.com/user-attachments/assets/3413a486-d71c-4285-841d-76bbe74f830a" width="226" height="200" alt="Image" align="right" style="margin-left: 15px; margin: 10px;">
+
 <p align="center">
   <strong>Directly Creates and Runs Its Own Neural AI in Pure Go</strong><br>
   <em>Stop borrowing third-party AIs. This engine creates its own domain artificial intelligence from scratch in 1.5 seconds, routing execution flow in ~30 μs with 0 B/op (Zero Allocations), Zero Downloads, and Zero CGO.</em>
