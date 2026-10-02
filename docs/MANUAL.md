@@ -273,28 +273,53 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 #### Idiomatic Sentinel Error Matching
 
 ```go
-decision, err := router.RouteQuery(ctx, userInput)
-if err != nil {
-	switch {
-	case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
-		// Foreign glyphs, unlearned slang, or noise: reject immediately without cloud API cost
-		return writeClientError("Unrecognized words, please rephrase.")
+package main
 
-	case errors.Is(err, neurogate.ErrOutOfDomain), errors.Is(err, neurogate.ErrLowConfidence):
-		// Low activation energy or high chaos: safely shunt to Cloud LLM fallback
-		return proxyToGeminiCloudLLM(ctx, userInput)
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
 
-	case errors.Is(err, neurogate.ErrAmbiguousIntent):
-		// Competing top candidates: ask user to clarify between Intent and SecondaryIntent
-		return promptDisambiguation(decision.Intent, decision.SecondaryIntent)
+	"github.com/gluedays-cyber/neurogate"
+)
 
-	default:
-		return err
+func ProcessUserQuery(ctx context.Context, router *neurogate.Router, query string) {
+	// Synchronous zero-allocation Fail-Safe evaluation
+	decision, err := router.RouteQuery(ctx, query)
+	if err != nil {
+		switch {
+		case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
+			// [Layer 1 Guard (< 1 μs)]: Foreign glyphs, unlearned slang, or noise
+			// Rejects immediately without forward pass, saving cloud LLM API cost
+			fmt.Printf("[L1 REJECT] Unlearned words (single-char ratio: %.1f%%). Prompting user.\n",
+				decision.SingleCharRatio*100)
+			return
+
+		case errors.Is(err, neurogate.ErrOutOfDomain), errors.Is(err, neurogate.ErrLowConfidence):
+			// [Layer 2 Guard (~29 μs)]: Low activation energy or high distribution chaos
+			// Safely shunts query to Cloud LLM fallback (e.g. Gemini)
+			fmt.Printf("[L2 ESCALATE] Out-of-Domain detected (Energy: %.2f, Entropy: %.2f). Calling Cloud LLM.\n",
+				decision.Energy, decision.Entropy)
+			return
+
+		case errors.Is(err, neurogate.ErrAmbiguousIntent):
+			// [Layer 2 Guard (~29 μs)]: Competing top candidates
+			// Prompts user to clarify between Intent and SecondaryIntent
+			fmt.Printf("[L2 AMBIGUOUS] Ambiguous intent (%s vs %s, margin: %.2f). Clarification needed.\n",
+				decision.Intent, decision.SecondaryIntent, decision.Margin)
+			return
+
+		default:
+			log.Printf("Internal error: %v", err)
+			return
+		}
 	}
-}
 
-// Proceed with confident domain execution (~29 μs, 0 B/op)
-executeDomainService(decision.Intent, userInput)
+	// Proceed with confident domain execution (~29 μs, strictly 0 B/op)
+	fmt.Printf("[EXECUTE 30μs] Action: %s (Confidence: %.2f%%)\n",
+		decision.Intent, decision.Confidence*100)
+}
 ```
 
 ---

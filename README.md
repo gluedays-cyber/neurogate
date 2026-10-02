@@ -335,31 +335,64 @@ Standard Softmax enforces $\sum P_i = 1.0$, which causes neural networks to outp
 
 ### Production Error-Returning Interface (`RouteQuery`)
 
-While `.Dispatch()` routes to callback handlers, `.RouteQuery()` returns standard Go sentinel errors for idiomatic `errors.Is` error handling:
+While `.Dispatch()` routes to registered callback handlers, `.RouteQuery()` returns standard Go sentinel errors for idiomatic `errors.Is` pattern matching:
 
 ```go
-decision, err := router.RouteQuery(ctx, userInput)
-if err != nil {
-    switch {
-    case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
-        // Layer 1 Cutoff: Reject unlearned words immediately without calling LLMs
-        return promptUser("Word not recognized, please rephrase.")
+package main
 
-    case errors.Is(err, neurogate.ErrOutOfDomain), errors.Is(err, neurogate.ErrLowConfidence):
-        // Layer 2 Cutoff: Safely escalate to Cloud LLM (Gemini) or human representative
-        return escalateToCloudLLM(ctx, userInput)
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
 
-    case errors.Is(err, neurogate.ErrAmbiguousIntent):
-        // Layer 2 Ambiguity: Query user to disambiguate between primary and secondary candidates
-        return askConfirmation(decision.Intent, decision.SecondaryIntent)
+	"github.com/gluedays-cyber/neurogate"
+)
 
-    default:
-        return handleSystemError(err)
-    }
+func main() {
+	// 1. Initialize router and load lightweight domain weights
+	router, err := neurogate.Open("weights/model.bin", 0.75)
+	if err != nil {
+		log.Fatalf("Failed to initialize router: %v", err)
+	}
+
+	ctx := context.Background()
+	userInput := "bruh can u refund order #49281"
+
+	// 2. Evaluate query with synchronous 2-layer Fail-Safe guards (~29 μs, 0 B/op)
+	decision, err := router.RouteQuery(ctx, userInput)
+	if err != nil {
+		switch {
+		case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
+			// [Layer 1 Guard (< 1 μs)]: Completely unlearned words or noisy characters
+			// Rejects before neural forward pass, eliminating cloud LLM invocation cost
+			fmt.Printf("[L1 REJECT] Unlearned words (single-char ratio: %.1f%%). Prompting user to rephrase.\n",
+				decision.SingleCharRatio*100)
+			return
+
+		case errors.Is(err, neurogate.ErrOutOfDomain), errors.Is(err, neurogate.ErrLowConfidence):
+			// [Layer 2 Guard (~29 μs)]: Low activation energy or high Shannon entropy
+			// Safely shunts query to Cloud LLM (Gemini) or human support queue
+			fmt.Printf("[L2 ESCALATE] Out-of-Domain detected (Energy: %.2f, Entropy: %.2f). Shunting to Cloud LLM.\n",
+				decision.Energy, decision.Entropy)
+			return
+
+		case errors.Is(err, neurogate.ErrAmbiguousIntent):
+			// [Layer 2 Guard (~29 μs)]: Competitive margin between top-2 intent candidates
+			// Prompts user to clarify between Intent and SecondaryIntent
+			fmt.Printf("[L2 AMBIGUOUS] Ambiguous intent (%s vs %s, margin: %.2f). Requesting clarification.\n",
+				decision.Intent, decision.SecondaryIntent, decision.Margin)
+			return
+
+		default:
+			log.Fatalf("Internal routing failure: %v", err)
+		}
+	}
+
+	// 3. Execute domain business logic safely with zero allocation
+	fmt.Printf("[DISPATCH 30μs] Confident Route: %s (Confidence: %.2f%%)\n",
+		decision.Intent, decision.Confidence*100)
 }
-
-// 29 μs Zero-Alloc execution of verified intent
-executeAction(decision.Intent, userInput)
 ```
 
 ---
