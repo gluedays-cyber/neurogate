@@ -1,7 +1,7 @@
 ﻿# NeuroGate
 
 <p align="center">
-  <img src="assets/neurogate-hero.svg" width="100%" alt="NeuroGate vs Retro Branching — Electric Hyperbike vs Rusty Bicycle">
+  <img src="assets/neurogate-hero.jpg" width="100%" alt="NeuroGate vs Retro Branching — Electric Hyperbike vs Rusty Bicycle">
 </p>
 <p align="center">
   <strong>Directly Creates and Runs Its Own Neural AI in Pure Go</strong><br>
