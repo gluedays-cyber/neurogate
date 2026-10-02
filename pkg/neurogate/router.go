@@ -3,9 +3,11 @@ package neurogate
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // RouteAction defines the execution handler signature for a matched branch.
@@ -19,24 +21,41 @@ type PipelineAction func(ctx context.Context, primary string, secondary string, 
 
 // DispatchPolicy defines the 3-tier confidence criteria, multi-intent threshold, and OOD entropy boundary.
 type DispatchPolicy struct {
-	HighThreshold     float64 `json:"high_threshold"`      // Minimum confidence for definite execution (default: 0.75)
-	LowThreshold      float64 `json:"low_threshold"`       // Minimum confidence below which request is isolated to Fallback (default: 0.40)
-	MarginCutoff      float64 `json:"margin_cutoff"`       // Minimum required gap between Top-1 and Top-2 (default: 0.15)
-	MaxEntropy        float64 `json:"max_entropy"`         // Maximum allowable prediction entropy before triggering OOD Fallback (default: 2.0)
-	PipelineThreshold float64 `json:"pipeline_threshold"`  // Minimum secondary confidence to qualify for multi-intent pipeline (default: 0.30)
-	MinLogSumExp      float64 `json:"min_log_sum_exp,omitempty"` // Minimum log-sum-exp energy boundary before OOD isolation (0 disables)
+	HighThreshold        float64 `json:"high_threshold"`            // Minimum confidence for definite execution (default: 0.75)
+	LowThreshold         float64 `json:"low_threshold"`             // Minimum confidence below which request is isolated to Fallback (default: 0.40)
+	MarginCutoff         float64 `json:"margin_cutoff"`             // Minimum required gap between Top-1 and Top-2 (default: 0.15)
+	MaxEntropy           float64 `json:"max_entropy"`               // Maximum allowable prediction entropy before triggering OOD Fallback (default: 2.0)
+	PipelineThreshold    float64 `json:"pipeline_threshold"`        // Minimum secondary confidence to qualify for multi-intent pipeline (default: 0.30)
+	MinLogSumExp         float64 `json:"min_log_sum_exp,omitempty"` // Minimum log-sum-exp energy boundary before OOD isolation (0 disables)
+	MaxSingleCharRatio   float64 `json:"max_single_char_ratio"`     // Layer 1: Max ratio of single-char fallback tokens (default: 0.70)
+	MaxUnknownTokenRatio float64 `json:"max_unknown_token_ratio"`   // Layer 1: Max ratio of UNK tokens (default: 0.30)
 }
 
 // DefaultDispatchPolicy creates standard production-ready 3-tier routing criteria.
 func DefaultDispatchPolicy() DispatchPolicy {
 	return DispatchPolicy{
-		HighThreshold:     0.75,
-		LowThreshold:      0.40,
-		MarginCutoff:      0.15,
-		MaxEntropy:        2.0,
-		PipelineThreshold: 0.30,
-		MinLogSumExp:      0.0,
+		HighThreshold:        0.75,
+		LowThreshold:         0.40,
+		MarginCutoff:         0.15,
+		MaxEntropy:           2.0,
+		PipelineThreshold:    0.30,
+		MinLogSumExp:         0.0,
+		MaxSingleCharRatio:   0.70,
+		MaxUnknownTokenRatio: 0.30,
 	}
+}
+
+// RouteDecision encapsulates the verified intent result and diagnostic signals for fail-safe error handling.
+type RouteDecision struct {
+	Intent              string             `json:"intent"`
+	Confidence          float64            `json:"confidence"`
+	Entropy             float64            `json:"entropy"`
+	Energy              float64            `json:"energy"`
+	Margin              float64            `json:"margin"`
+	SingleCharRatio     float64            `json:"single_char_ratio"`
+	UnknownTokenRatio   float64            `json:"unknown_token_ratio"`
+	SecondaryIntent     string             `json:"secondary_intent,omitempty"`
+	SecondaryConfidence float64            `json:"secondary_confidence,omitempty"`
 }
 
 // RouteTrace encapsulates comprehensive diagnostic metadata explaining a routing decision.
@@ -44,6 +63,7 @@ type RouteTrace struct {
 	InputText          string             `json:"input_text"`
 	TokenIDs           []uint32           `json:"token_ids"`
 	Subwords           []string           `json:"subwords"`
+	SingleCharRatio    float64            `json:"single_char_ratio"`
 	UnknownTokenRatio  float64            `json:"unknown_token_ratio"`
 	ClassProbabilities map[string]float32 `json:"class_probabilities"`
 	PredictedLabel     string             `json:"predicted_label"`
@@ -51,6 +71,7 @@ type RouteTrace struct {
 	Confidence         float64            `json:"confidence"`
 	Margin             float64            `json:"margin"`
 	Entropy            float64            `json:"entropy"`
+	Energy             float64            `json:"energy"`
 	Threshold          float64            `json:"threshold"`
 	IsAmbiguous        bool               `json:"is_ambiguous"`
 	IsPipeline         bool               `json:"is_pipeline"`
@@ -58,6 +79,7 @@ type RouteTrace struct {
 	FallbackReason     string             `json:"fallback_reason,omitempty"`
 	LatencyMicros      int64              `json:"latency_micros"`
 }
+
 
 func pipelineKey(primary, secondary string) string {
 	return primary + "->" + secondary
@@ -212,6 +234,125 @@ func (r *Router) Fallback(action RouteAction) *Router {
 	return r
 }
 
+// RouteQuery executes 2-layer fail-safe evaluation and returns standard Go sentinel errors on failure.
+func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, error) {
+	select {
+	case <-ctx.Done():
+		return RouteDecision{}, ctx.Err()
+	default:
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if err := ctx.Err(); err != nil {
+		return RouteDecision{}, err
+	}
+
+	model := r.model.Load()
+	if model == nil {
+		return RouteDecision{}, ErrModelNotInitialized
+	}
+
+	if !utf8.ValidString(text) {
+		return RouteDecision{}, ErrEmptyInput
+	}
+	if len(text) > MaxInputBytes {
+		text = TruncateToRuneBoundary(text, MaxInputBytes)
+	}
+
+	tokenIDs := model.Tokenizer.Encode(text)
+	if len(tokenIDs) == 0 {
+		return RouteDecision{}, ErrEmptyInput
+	}
+	if len(tokenIDs) > MaxSequenceTokens {
+		tokenIDs = tokenIDs[:MaxSequenceTokens]
+	}
+
+	// -------------------------------------------------------------
+	// [Layer 1 Guard] Tokenizer-level unlearned vocabulary cutoff (< 1 μs)
+	// -------------------------------------------------------------
+	singleRatio, unkRatio := model.Tokenizer.AnalyzeUnlearnedRatio(tokenIDs)
+	if len(tokenIDs) >= 2 && r.policy.MaxSingleCharRatio > 0.0 && singleRatio >= r.policy.MaxSingleCharRatio {
+		return RouteDecision{
+			SingleCharRatio:   singleRatio,
+			UnknownTokenRatio: unkRatio,
+		}, ErrUnlearnedVocabulary
+	}
+	if r.policy.MaxUnknownTokenRatio > 0.0 && unkRatio >= r.policy.MaxUnknownTokenRatio {
+		return RouteDecision{
+			SingleCharRatio:   singleRatio,
+			UnknownTokenRatio: unkRatio,
+		}, ErrUnlearnedVocabulary
+	}
+
+	// -------------------------------------------------------------
+	// [Layer 2 Guard] Neural forward pass & metric-based cutoff (~29 μs)
+	// -------------------------------------------------------------
+	res, err := model.PredictSlots(tokenIDs, model.Temperature)
+	if err != nil {
+		return RouteDecision{}, err
+	}
+	if res.Total == 0 {
+		return RouteDecision{}, ErrOutOfDomain
+	}
+
+	primaryIdx := int(res.Primary.Index)
+	if primaryIdx < 0 || primaryIdx >= len(model.Labels) {
+		return RouteDecision{}, ErrClassIndexOutOfRange
+	}
+
+	primaryLabel := model.Labels[primaryIdx]
+	primaryConf := float64(res.Primary.Confidence)
+	entropy := float64(res.Entropy)
+	energy := float64(res.Energy)
+
+	var secondaryLabel string
+	var secondaryConf float64
+	if res.Total >= 2 {
+		secIdx := int(res.Secondary.Index)
+		if secIdx >= 0 && secIdx < len(model.Labels) {
+			secondaryLabel = model.Labels[secIdx]
+			secondaryConf = float64(res.Secondary.Confidence)
+		}
+	}
+	margin := primaryConf - secondaryConf
+
+	decision := RouteDecision{
+		Intent:              primaryLabel,
+		Confidence:          primaryConf,
+		Entropy:             entropy,
+		Energy:              energy,
+		Margin:              margin,
+		SingleCharRatio:     singleRatio,
+		UnknownTokenRatio:   unkRatio,
+		SecondaryIntent:     secondaryLabel,
+		SecondaryConfidence: secondaryConf,
+	}
+
+	// 1. Energy boundary (LogSumExp)
+	if r.policy.MinLogSumExp != 0.0 && energy < r.policy.MinLogSumExp {
+		return decision, ErrOutOfDomain
+	}
+
+	// 2. High entropy boundary
+	if entropy > r.policy.MaxEntropy {
+		return decision, ErrHighEntropy
+	}
+
+	// 3. Low confidence boundary
+	if primaryConf < r.policy.LowThreshold {
+		return decision, ErrLowConfidence
+	}
+
+	// 4. Ambiguity margin boundary
+	if primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff {
+		return decision, ErrAmbiguousIntent
+	}
+
+	return decision, nil
+}
+
 // Dispatch executes microsecond inference and routes through a 3-tier decision pipeline (Definite / Ambiguous / Fallback).
 func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 	// Guard 0: Check context cancellation immediately before acquiring lock
@@ -242,6 +383,15 @@ func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 		return r.fallback(ctx, payload)
 	}
 
+	tokenIDs := model.Tokenizer.Encode(text)
+	singleRatio, _ := model.Tokenizer.AnalyzeUnlearnedRatio(tokenIDs)
+
+	// Layer 1 Fallback Guard: check unlearned vocabulary single-character fragmenting
+	if len(tokenIDs) >= 2 && r.policy.MaxSingleCharRatio > 0.0 && singleRatio >= r.policy.MaxSingleCharRatio {
+		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
+		return r.fallback(ctx, payload)
+	}
+
 	primaryIdx := int(res.Primary.Index)
 	if primaryIdx < 0 || primaryIdx >= len(model.Labels) {
 		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
@@ -261,9 +411,10 @@ func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 	}
 	margin := primaryConf - secondaryConf
 	entropy := float64(res.Entropy)
+	energy := float64(res.Energy)
 
-	// 1. Fallback Isolation: Low confidence, excessive UNKs, or high entropy (OOD)
-	if primaryConf < r.policy.LowThreshold || unkRatio >= 0.5 || entropy > r.policy.MaxEntropy {
+	// Layer 2 Fallback Guard: Low confidence, excessive UNKs, high entropy (OOD), or low energy
+	if primaryConf < r.policy.LowThreshold || unkRatio >= 0.5 || entropy > r.policy.MaxEntropy || (r.policy.MinLogSumExp != 0.0 && energy < r.policy.MinLogSumExp) {
 		r.recordTelemetry(text, primaryLabel, secondaryLabel, primaryConf, entropy, false, false, true)
 		return r.fallback(ctx, payload)
 	}
@@ -292,6 +443,7 @@ func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 
 	return action(ctx, payload)
 }
+
 
 // Inspect evaluates input text and generates a full diagnostic RouteTrace including 3-tier and entropy metrics.
 func (r *Router) Inspect(text string) RouteTrace {
@@ -343,10 +495,7 @@ func (r *Router) Inspect(text string) RouteTrace {
 		}
 	}
 
-	var unkRatio float64
-	if hasUnk && len(tokens) > 0 {
-		unkRatio = float64(unkCount) / float64(len(tokens))
-	}
+	singleRatio, unkRatio := model.Tokenizer.AnalyzeUnlearnedRatio(tokens)
 
 	probs, err := model.Forward(tokens, model.Temperature)
 	probMap := make(map[string]float32, len(model.Labels))
@@ -370,15 +519,21 @@ func (r *Router) Inspect(text string) RouteTrace {
 	}
 
 	// Guard 3: Apply calibrated confidence penalty
-	calibratedConfidence := float64(bestScore) * (1.0 - unkRatio)
-	calibratedSecond := float64(secondScore) * (1.0 - unkRatio)
+	effectivePenalty := unkRatio
+	if singleRatio > 0.5 {
+		effectivePenalty = math.Max(unkRatio, (singleRatio-0.5)*2.0)
+	}
+	calibratedConfidence := float64(bestScore) * (1.0 - effectivePenalty)
+	calibratedSecond := float64(secondScore) * (1.0 - effectivePenalty)
 	margin := calibratedConfidence - calibratedSecond
 	entropy := float64(computeEntropy(probs))
+	energy := float64(LogSumExp(probs))
 
 	trace := RouteTrace{
 		InputText:          text,
 		TokenIDs:           tokens,
 		Subwords:           subwords,
+		SingleCharRatio:    singleRatio,
 		UnknownTokenRatio:  unkRatio,
 		ClassProbabilities: probMap,
 		PredictedLabel:     bestLabel,
@@ -386,6 +541,7 @@ func (r *Router) Inspect(text string) RouteTrace {
 		Confidence:         calibratedConfidence,
 		Margin:             margin,
 		Entropy:            entropy,
+		Energy:             energy,
 		Threshold:          r.policy.HighThreshold,
 		LatencyMicros:      time.Since(start).Microseconds(),
 	}
@@ -393,6 +549,9 @@ func (r *Router) Inspect(text string) RouteTrace {
 	if err != nil {
 		trace.IsFallback = true
 		trace.FallbackReason = fmt.Sprintf("inference error: %v", err)
+	} else if len(tokens) >= 2 && r.policy.MaxSingleCharRatio > 0.0 && singleRatio >= r.policy.MaxSingleCharRatio {
+		trace.IsFallback = true
+		trace.FallbackReason = fmt.Sprintf("unlearned vocabulary (single-char ratio %.2f >= %.2f)", singleRatio, r.policy.MaxSingleCharRatio)
 	} else if trace.Confidence < r.policy.LowThreshold {
 		trace.IsFallback = true
 		trace.FallbackReason = fmt.Sprintf("confidence %.4f below low threshold %.4f", trace.Confidence, r.policy.LowThreshold)
@@ -402,6 +561,9 @@ func (r *Router) Inspect(text string) RouteTrace {
 	} else if entropy > r.policy.MaxEntropy {
 		trace.IsFallback = true
 		trace.FallbackReason = fmt.Sprintf("prediction entropy %.4f exceeds limit %.4f (OOD)", entropy, r.policy.MaxEntropy)
+	} else if r.policy.MinLogSumExp != 0.0 && energy < r.policy.MinLogSumExp {
+		trace.IsFallback = true
+		trace.FallbackReason = fmt.Sprintf("energy %.4f below minimum threshold %.4f (OOD)", energy, r.policy.MinLogSumExp)
 	} else {
 		if secondLabel != "" && calibratedSecond >= r.policy.PipelineThreshold {
 			trace.IsPipeline = true

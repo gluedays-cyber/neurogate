@@ -223,3 +223,69 @@ func DotProduct(a, b []float32) float32 {
 	}
 	return sum
 }
+
+// LogSumExp calculates ln(sum(exp(x_i))) in a numerically stable manner with zero heap allocations.
+func LogSumExp(logits []float32) float32 {
+	n := len(logits)
+	if n == 0 {
+		return 0.0
+	}
+
+	maxLogit := SafeClamp(logits[0], NumericalClampLimit)
+	for i := 1; i < n; i++ {
+		val := SafeClamp(logits[i], NumericalClampLimit)
+		if val > maxLogit {
+			maxLogit = val
+		}
+	}
+
+	var sumExp float64
+	for i := 0; i < n; i++ {
+		val := SafeClamp(logits[i], NumericalClampLimit) - maxLogit
+		e := math.Exp(float64(val))
+		if !math.IsNaN(e) && !math.IsInf(e, 0) {
+			sumExp += e
+		}
+	}
+
+	if sumExp <= 0.0 || math.IsNaN(sumExp) || math.IsInf(sumExp, 0) {
+		return maxLogit
+	}
+
+	return maxLogit + float32(math.Log(sumExp))
+}
+
+// CosineSimilarity calculates the cosine similarity between two float32 vectors.
+func CosineSimilarity(a, b []float32) float32 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	if n == 0 {
+		return 0.0
+	}
+
+	var dot, normA, normB float64
+	for i := 0; i < n; i++ {
+		va := float64(a[i])
+		vb := float64(b[i])
+		dot += va * vb
+		normA += va * va
+		normB += vb * vb
+	}
+
+	denom := math.Sqrt(normA) * math.Sqrt(normB)
+	if denom < 1e-7 || math.IsNaN(denom) || math.IsInf(denom, 0) {
+		return 0.0
+	}
+
+	sim := float32(dot / denom)
+	if sim > 1.0 {
+		return 1.0
+	}
+	if sim < -1.0 {
+		return -1.0
+	}
+	return sim
+}
+

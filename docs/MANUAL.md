@@ -1,4 +1,4 @@
-# NeuroGate: Embedded Neural AI Manual & Tutorial for Go Developers
+﻿# NeuroGate: Embedded Neural AI Manual & Tutorial for Go Developers
 
 This guide provides pure Go engineers with a deep-dive technical manual and hands-on tutorial for **NeuroGate: An Engine That Directly Creates and Runs Its Own Domain Artificial Intelligence**. Stop borrowing external models—learn how to design domain knowledge, generate lightweight neural networks from scratch in seconds, and execute microsecond AI-driven control flow with zero dependencies.
 
@@ -17,6 +17,7 @@ This guide provides pure Go engineers with a deep-dive technical manual and hand
    - [Multi-Intent: `BindPipeline` & `DefaultPipeline`](#35-bindpipeline--defaultpipeline)
    - [Safety Isolation: `Fallback`](#36-fallback)
    - [Inference & Branching: `Dispatch` & `DispatchPipeline`](#37-dispatch--dispatchpipeline)
+   - [Fail-Safe Sentinel Error Handling: `RouteQuery`](#371-fail-safe-sentinel-error-handling-routequery)
    - [Whitebox Observability: `Inspect` & `RouteTrace`](#38-inspect--routetrace)
    - [Atomic Hot-Swap: `Reload` & `SwapModel`](#39-reload--swapmodel)
    - [Active Learning: `EnableTelemetry` & `DrainTelemetry`](#310-enabletelemetry--draintelemetry)
@@ -142,12 +143,24 @@ func NewRouter(weightsPath string, defaultThreshold float64) (*Router, error)
 Defines 3-tier confidence boundaries, margin cutoffs, Shannon entropy limits, and multi-intent eligibility.
 
 ```go
+// FailSafe Sentinel Errors (Layer 1 & Layer 2)
+var (
+	ErrUnlearnedVocabulary = errors.New("neurogate: input dominated by unlearned subwords or OOV fragments")
+	ErrLowConfidence       = errors.New("neurogate: prediction confidence below safety threshold")
+	ErrHighEntropy         = errors.New("neurogate: prediction entropy exceeds uncertainty boundary")
+	ErrOutOfDomain         = errors.New("neurogate: request energy or representation is out of domain")
+	ErrAmbiguousIntent     = errors.New("neurogate: ambiguous intent between competing candidates")
+)
+
 type DispatchPolicy struct {
-    HighThreshold     float64 `json:"high_threshold"`     // Min confidence for definite execution (default: 0.75)
-    LowThreshold      float64 `json:"low_threshold"`      // Min confidence below which request goes to Fallback (default: 0.40)
-    MarginCutoff      float64 `json:"margin_cutoff"`      // Min required gap between Top-1 and Top-2 (default: 0.15)
-    MaxEntropy        float64 `json:"max_entropy"`        // Max allowable prediction entropy before OOD isolation (default: 2.0)
-    PipelineThreshold float64 `json:"pipeline_threshold"` // Min secondary confidence for multi-intent pipeline (default: 0.30)
+    HighThreshold        float64 `json:"high_threshold"`            // Min confidence for definite execution (default: 0.75)
+    LowThreshold         float64 `json:"low_threshold"`             // Min confidence below which request goes to Fallback (default: 0.40)
+    MarginCutoff         float64 `json:"margin_cutoff"`             // Min required gap between Top-1 and Top-2 (default: 0.15)
+    MaxEntropy           float64 `json:"max_entropy"`               // Max allowable prediction entropy before OOD isolation (default: 2.0)
+    PipelineThreshold    float64 `json:"pipeline_threshold"`        // Min secondary confidence for multi-intent pipeline (default: 0.30)
+    MinLogSumExp         float64 `json:"min_log_sum_exp,omitempty"` // Min log-sum-exp energy boundary before OOD isolation (0 disables)
+    MaxSingleCharRatio   float64 `json:"max_single_char_ratio"`     // Layer 1: Max ratio of single-char fallback tokens (default: 0.70)
+    MaxUnknownTokenRatio float64 `json:"max_unknown_token_ratio"`   // Layer 1: Max ratio of UNK tokens (default: 0.30)
 }
 
 func (r *Router) SetPolicy(policy DispatchPolicy) *Router
@@ -226,6 +239,66 @@ func (r *Router) DispatchPipeline(ctx context.Context, text string, payload any)
 
 ---
 
+### 3.7.1. Fail-Safe Sentinel Error Handling: `RouteQuery`
+
+For applications requiring standard Go `error` returns rather than internal callback handlers, `RouteQuery` provides a synchronous, zero-heap-allocation interface enforcing the complete 2-layer Fail-Safe defense:
+
+```go
+type RouteDecision struct {
+	Intent              string  `json:"intent"`
+	Confidence          float64 `json:"confidence"`
+	Entropy             float64 `json:"entropy"`
+	Energy              float64 `json:"energy"`
+	Margin              float64 `json:"margin"`
+	SingleCharRatio     float64 `json:"single_char_ratio"`
+	UnknownTokenRatio   float64 `json:"unknown_token_ratio"`
+	SecondaryIntent     string  `json:"secondary_intent,omitempty"`
+	SecondaryConfidence float64 `json:"secondary_confidence,omitempty"`
+}
+
+func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, error)
+```
+
+#### Layer 1 & 2 Cutoff Rules
+
+| Phase | Metric Checked | Cutoff Condition | Returned Sentinel Error | Execution Cost |
+| :--- | :--- | :--- | :--- | :--- |
+| **Layer 1** (Tokenizer) | Single-character fragment ratio | `SingleCharRatio >= MaxSingleCharRatio` (0.70) | `ErrUnlearnedVocabulary` | **< 1 μs** (No forward pass) |
+| **Layer 1** (Tokenizer) | UNK token ratio | `UnknownTokenRatio >= MaxUnknownTokenRatio` (0.30) | `ErrUnlearnedVocabulary` | **< 1 μs** (No forward pass) |
+| **Layer 2** (Neural Output) | Free energy ($-\text{LogSumExp}$) | `Energy < MinLogSumExp` (if configured) | `ErrOutOfDomain` | **~29 μs** (MLP forward) |
+| **Layer 2** (Neural Output) | Shannon entropy | `Entropy > MaxEntropy` (default: 2.0) | `ErrHighEntropy` | **~29 μs** (MLP forward) |
+| **Layer 2** (Neural Output) | Primary confidence | `Confidence < LowThreshold` (default: 0.40) | `ErrLowConfidence` | **~29 μs** (MLP forward) |
+| **Layer 2** (Neural Output) | Top-1/Top-2 margin gap | `Margin < MarginCutoff` (default: 0.15) | `ErrAmbiguousIntent` | **~29 μs** (MLP forward) |
+
+#### Idiomatic Sentinel Error Matching
+
+```go
+decision, err := router.RouteQuery(ctx, userInput)
+if err != nil {
+	switch {
+	case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
+		// Foreign glyphs, unlearned slang, or noise: reject immediately without cloud API cost
+		return writeClientError("Unrecognized words, please rephrase.")
+
+	case errors.Is(err, neurogate.ErrOutOfDomain), errors.Is(err, neurogate.ErrLowConfidence):
+		// Low activation energy or high chaos: safely shunt to Cloud LLM fallback
+		return proxyToGeminiCloudLLM(ctx, userInput)
+
+	case errors.Is(err, neurogate.ErrAmbiguousIntent):
+		// Competing top candidates: ask user to clarify between Intent and SecondaryIntent
+		return promptDisambiguation(decision.Intent, decision.SecondaryIntent)
+
+	default:
+		return err
+	}
+}
+
+// Proceed with confident domain execution (~29 μs, 0 B/op)
+executeDomainService(decision.Intent, userInput)
+```
+
+---
+
 ### 3.8. `Inspect` & `RouteTrace`
 
 Evaluates input text and returns a full diagnostic trace without triggering business handlers.
@@ -239,6 +312,7 @@ type RouteTrace struct {
     InputText          string             `json:"input_text"`
     TokenIDs           []uint32           `json:"token_ids"`
     Subwords           []string           `json:"subwords"`
+    SingleCharRatio    float64            `json:"single_char_ratio"`
     UnknownTokenRatio  float64            `json:"unknown_token_ratio"`
     ClassProbabilities map[string]float32 `json:"class_probabilities"`
     PredictedLabel     string             `json:"predicted_label"`

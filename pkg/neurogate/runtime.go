@@ -19,6 +19,13 @@ const (
 var (
 	ErrModelNotInitialized = errors.New("model not properly initialized")
 	ErrClassIndexOutOfRange = errors.New("predicted class index exceeds label count")
+
+	// Fail-Safe Sentinel Errors (Layer 1 & Layer 2)
+	ErrUnlearnedVocabulary = errors.New("neurogate: input dominated by unlearned subwords or OOV fragments")
+	ErrLowConfidence       = errors.New("neurogate: prediction confidence below safety threshold")
+	ErrHighEntropy         = errors.New("neurogate: prediction entropy exceeds uncertainty boundary")
+	ErrOutOfDomain         = errors.New("neurogate: request energy or representation is out of domain")
+	ErrAmbiguousIntent     = errors.New("neurogate: ambiguous intent between competing candidates")
 )
 
 // inferenceBuffer holds scratch memory slices to enable zero-allocation forward passes.
@@ -87,8 +94,10 @@ type StaticInferenceResult struct {
 	Primary   MatchSlot
 	Secondary MatchSlot
 	Entropy   float32
+	Energy    float32
 	Total     uint8
 }
+
 
 // computeEntropy calculates Shannon entropy in bits with epsilon guards to prevent NaN/Inf underflows.
 func computeEntropy(probs []float32) float32 {
@@ -187,6 +196,7 @@ func (m *InferenceModel) PredictSlots(tokenIDs []uint32, temperature float32) (S
 		res.Total = 2
 	}
 	res.Entropy = computeEntropy(buf.probs)
+	res.Energy = LogSumExp(buf.logits)
 
 	return res, nil
 }
@@ -228,24 +238,23 @@ func (m *InferenceModel) PredictDetailed(text string) (StaticInferenceResult, fl
 		return StaticInferenceResult{}, 0.0, err
 	}
 
-	// Guard 3: Calculate UNK ratio and penalize confidence proportionally
-	var unkRatio float64
-	unkID, hasUnk := m.Tokenizer.VocabMap["[UNK]"]
-	if hasUnk && len(tokenIDs) > 0 {
-		unkCount := 0
-		for _, id := range tokenIDs {
-			if id == unkID {
-				unkCount++
-			}
-		}
-		unkRatio = float64(unkCount) / float64(len(tokenIDs))
-		decay := float32(1.0 - unkRatio)
-		res.Primary.Confidence *= decay
-		res.Secondary.Confidence *= decay
+	// Guard 3: Calculate UNK & single-character fallback ratio, then penalize confidence proportionally
+	singleRatio, unkRatio := m.Tokenizer.AnalyzeUnlearnedRatio(tokenIDs)
+	effectivePenalty := unkRatio
+	if singleRatio > 0.5 {
+		effectivePenalty = math.Max(unkRatio, (singleRatio-0.5)*2.0)
 	}
 
-	return res, unkRatio, nil
+	decay := float32(1.0 - effectivePenalty)
+	if decay < 0.0 {
+		decay = 0.0
+	}
+	res.Primary.Confidence *= decay
+	res.Secondary.Confidence *= decay
+
+	return res, effectivePenalty, nil
 }
+
 
 // TruncateToRuneBoundary truncates text to at most maxBytes without slicing multi-byte UTF-8 runes.
 func TruncateToRuneBoundary(text string, maxBytes int) string {

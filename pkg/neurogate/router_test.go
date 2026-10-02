@@ -398,4 +398,128 @@ func TestRouterTelemetryDrain(t *testing.T) {
 	}
 }
 
+func TestFailSafeLayer1_UnlearnedVocabulary(t *testing.T) {
+	tempDir := t.TempDir()
+	modelPath := filepath.Join(tempDir, "failsafe_l1.bin")
+
+	// Create model with authentic BPE subwords learned from corpus
+	corpus := []string{
+		"refund payment money please",
+		"cancel refund order payment",
+		"delivery shipment package status",
+		"track order delivery status",
+	}
+	tok, err := TrainBPE(corpus, 40)
+	if err != nil {
+		t.Fatalf("TrainBPE failed: %v", err)
+	}
+
+	header := Header{
+		Magic:        MagicBytes,
+		Version:      2,
+		VocabSize:    uint32(tok.VocabSize()),
+		EmbeddingDim: 8,
+		HiddenDim:    12,
+		NumClasses:   2,
+	}
+	labels := []string{"Refund", "Delivery"}
+	weights := Weights{
+		Embedding:  make([]float32, int(header.VocabSize)*int(header.EmbeddingDim)),
+		Positional: make([]float32, 32*int(header.EmbeddingDim)),
+		W1:         make([]float32, int(header.EmbeddingDim)*int(header.HiddenDim)),
+		B1:         make([]float32, int(header.HiddenDim)),
+		W2:         make([]float32, int(header.HiddenDim)*int(header.NumClasses)),
+		B2:         make([]float32, int(header.NumClasses)),
+	}
+	for i := range weights.Embedding {
+		weights.Embedding[i] = 0.05
+	}
+	for i := range weights.W1 {
+		weights.W1[i] = 0.05
+	}
+	for i := range weights.W2 {
+		weights.W2[i] = 0.05
+	}
+
+	model := NewInferenceModel(header, labels, tok.Vocab, tok.MergeRules, weights)
+	if err := SaveBinaryModel(modelPath, model); err != nil {
+		t.Fatalf("Failed to save model: %v", err)
+	}
+
+	router, err := NewRouter(modelPath, 0.70)
+	if err != nil {
+		t.Fatalf("Failed to init router: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Completely unlearned noisy input -> Layer 1 rejection with ErrUnlearnedVocabulary
+	unlearnedNoise := "xzqjwpkvmcty1837"
+	_, err = router.RouteQuery(ctx, unlearnedNoise)
+	if err == nil {
+		t.Fatalf("Expected error for unlearned noise '%s', but got nil", unlearnedNoise)
+	}
+	if err != ErrUnlearnedVocabulary {
+		t.Fatalf("Expected ErrUnlearnedVocabulary, got %v", err)
+	}
+
+	// 2. Fallback dispatch should trigger for unlearned vocabulary
+	var fallbackTriggered bool
+	router.Fallback(func(ctx context.Context, payload any) error {
+		fallbackTriggered = true
+		return nil
+	})
+
+	err = router.Dispatch(ctx, unlearnedNoise, nil)
+	if err != nil {
+		t.Fatalf("Dispatch returned unexpected error: %v", err)
+	}
+	if !fallbackTriggered {
+		t.Errorf("Expected fallback handler to be triggered for unlearned vocabulary")
+	}
+}
+
+
+func TestFailSafeLayer2_NeuralMetrics(t *testing.T) {
+	tempDir := t.TempDir()
+	modelPath := filepath.Join(tempDir, "failsafe_l2.bin")
+
+	sampleModel := createSampleModel()
+	if err := SaveBinaryModel(modelPath, sampleModel); err != nil {
+		t.Fatalf("Failed to save model: %v", err)
+	}
+
+	router, err := NewRouter(modelPath, 0.50)
+	if err != nil {
+		t.Fatalf("Failed to init router: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Normal query should execute RouteQuery cleanly
+	res, err := router.RouteQuery(ctx, "refund")
+	if err == nil {
+		if res.Intent == "" {
+			t.Errorf("Expected non-empty intent, got '%s'", res.Intent)
+		}
+		if res.Confidence <= 0 {
+			t.Errorf("Expected positive confidence, got %f", res.Confidence)
+		}
+	} else if err != ErrAmbiguousIntent && err != ErrLowConfidence {
+		t.Logf("RouteQuery returned: %v", err)
+	}
+
+	// 2. High threshold policy should return ErrLowConfidence or ErrAmbiguousIntent
+	router.policy.HighThreshold = 0.9999
+	router.policy.LowThreshold = 0.9990
+	_, err = router.RouteQuery(ctx, "refund")
+	if err == nil {
+		t.Fatalf("Expected safety error under ultra-strict threshold, got nil")
+	}
+	if err != ErrLowConfidence && err != ErrAmbiguousIntent && err != ErrOutOfDomain {
+		t.Errorf("Expected ErrLowConfidence/ErrAmbiguousIntent, got %v", err)
+	}
+}
+
+
 

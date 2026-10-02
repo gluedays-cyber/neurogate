@@ -11,6 +11,7 @@ type (
 	AmbiguousAction     = core.AmbiguousAction
 	PipelineAction      = core.PipelineAction
 	DispatchPolicy      = core.DispatchPolicy
+	RouteDecision       = core.RouteDecision
 	RouteTrace          = core.RouteTrace
 	TrainConfig         = core.TrainConfig
 	DataSample          = core.DataSample
@@ -18,6 +19,17 @@ type (
 	NeuroGate           = core.NeuroGate
 	TelemetryEvent      = core.TelemetryEvent
 	TelemetryRingBuffer = core.TelemetryRingBuffer
+)
+
+// Sentinel Errors
+var (
+	ErrModelNotInitialized = core.ErrModelNotInitialized
+	ErrClassIndexOutOfRange = core.ErrClassIndexOutOfRange
+	ErrUnlearnedVocabulary = core.ErrUnlearnedVocabulary
+	ErrLowConfidence       = core.ErrLowConfidence
+	ErrHighEntropy         = core.ErrHighEntropy
+	ErrOutOfDomain         = core.ErrOutOfDomain
+	ErrAmbiguousIntent     = core.ErrAmbiguousIntent
 )
 
 // High-level functions exported at the package root
@@ -41,4 +53,9 @@ var (
 	NewRouter             = core.NewRouter
 	NewNeuroGate          = core.NewNeuroGate
 	DefaultDispatchPolicy = core.DefaultDispatchPolicy
+
+	// Math & Ops
+	LogSumExp        = core.LogSumExp
+	CosineSimilarity = core.CosineSimilarity
 )
+

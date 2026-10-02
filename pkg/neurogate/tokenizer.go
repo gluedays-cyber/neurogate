@@ -157,17 +157,27 @@ func (t *BPETokenizer) Encode(text string) []uint32 {
 		return nil
 	}
 
+	// Fast path: if exact text exists directly in vocabulary (e.g., atomic words or sample models)
+	if id, exists := t.VocabMap[text]; exists {
+		return []uint32{id}
+	}
+
 	// 1. Initial character split
 	var tokens []uint32
+	unkID, hasUnk := t.VocabMap["[UNK]"]
 	for _, r := range text {
 		ch := string(r)
 		if id, exists := t.VocabMap[ch]; exists {
 			tokens = append(tokens, id)
+		} else if hasUnk {
+			tokens = append(tokens, unkID)
 		} else {
-			// [UNK]
-			tokens = append(tokens, t.VocabMap["[UNK]"])
+			// Fallback to index 0 ([PAD]) if [UNK] is not defined in model header
+			tokens = append(tokens, 0)
 		}
 	}
+
+
 
 	if len(tokens) <= 1 {
 		return tokens
@@ -223,3 +233,47 @@ func IsValidUtf8(s string) bool {
 func (t *BPETokenizer) VocabSize() int {
 	return len(t.Vocab)
 }
+
+// AnalyzeUnlearnedRatio computes the ratio of single-character fallback tokens and unknown tokens without allocations.
+func (t *BPETokenizer) AnalyzeUnlearnedRatio(tokens []uint32) (singleCharRatio float64, unkRatio float64) {
+	n := len(tokens)
+	if n == 0 {
+		return 1.0, 1.0
+	}
+
+	unkID, hasUnk := t.VocabMap["[UNK]"]
+	singleCharCount := 0
+	unkCount := 0
+
+	for _, id := range tokens {
+		if hasUnk && id == unkID {
+			unkCount++
+			continue
+		}
+		if int(id) < len(t.Vocab) {
+			str := t.Vocab[id]
+			if str != "[PAD]" && utf8.RuneCountInString(str) == 1 {
+				singleCharCount++
+			}
+		}
+	}
+
+	total := float64(n)
+	return float64(singleCharCount) / total, float64(unkCount) / total
+}
+
+// IsUnlearned determines if token sequence is dominated by unlearned single-character fragments or UNKs.
+func (t *BPETokenizer) IsUnlearned(tokens []uint32, maxSingleRatio float64, maxUnkRatio float64) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	singleRatio, unkRatio := t.AnalyzeUnlearnedRatio(tokens)
+	if maxSingleRatio > 0.0 && singleRatio >= maxSingleRatio {
+		return true
+	}
+	if maxUnkRatio > 0.0 && unkRatio >= maxUnkRatio {
+		return true
+	}
+	return false
+}
+

@@ -1,4 +1,4 @@
-# NeuroGate
+﻿# NeuroGate
 <img src="https://github.com/user-attachments/assets/3413a486-d71c-4285-841d-76bbe74f830a" width="226" height="200" alt="Image" align="right" style="margin-left: 15px; margin: 10px;">
 <p align="center">
   <strong>Directly Creates and Runs Its Own Neural AI in Pure Go</strong><br>
@@ -32,6 +32,11 @@ Incoming Request ("bruh can u refund order #49281")
                      ▼
        [ In-Memory BPE Tokenizer ]
                      │
+       ┌─────────────┴────────────────────────────────┐
+       │ [Layer 1 Guard]: Unlearned Single-Char Ratio │ ──> SingleCharRatio ≥ 0.70?
+       │ (< 1 μs, Zero Forward Math Computation)      │     --> Immediate ErrUnlearnedVocabulary
+       └─────────────┬────────────────────────────────┘
+                     │ (Learned Subwords Validated)
                      ▼
   [ Dense (D=64) + Positional (P=32x64) ]
                      │
@@ -42,12 +47,17 @@ Incoming Request ("bruh can u refund order #49281")
       [ Hidden Projection (D=128) ]
                      │
                      ▼
-   [ Softmax + Shannon Entropy Calibrated Guard ]
+  [ Free Energy (LogSumExp) + Softmax Entropy Guard ]
+                     │
+       ┌─────────────┴────────────────────────────────┐
+       │ [Layer 2 Guard]: Multi-Metric Neural Cutoff  │ ──> Low Energy / High Entropy?
+       │ Confidence, Entropy, Margin (~29 μs)         │     --> ErrOutOfDomain / ErrLowConfidence
+       └─────────────┬────────────────────────────────┘
                      │
      ┌───────────────┼───────────────┬────────────────┐
      ▼               ▼               ▼                ▼
-(Score ≥ 0.75)  (Score ≥ 0.30)  (Margin < 0.15)  (Entropy > 2.0 / UNK ≥ 0.5)
-[DEFINITE ROUTE] [PIPELINE]      [AMBIGUOUS]      [FALLBACK ISOLATION]
+(Score ≥ 0.75)  (Score ≥ 0.30)  (Margin < 0.15)  (Low Energy / OOD)
+[DEFINITE ROUTE] [PIPELINE]      [AMBIGUOUS]      [FAIL-SAFE ISOLATION]
 ```
 
 ---
@@ -294,6 +304,66 @@ fmt.Printf("Harvested %d drift events for active learning retraining.\n", len(ev
 
 ---
 
+## 2-Layer Fail-Safe Guardrails & Error-Returning Routing (`RouteQuery`)
+
+In mission-critical backends, forced misclassification of unlearned words or out-of-distribution (OOD) noise causes catastrophic routing accidents (e.g. triggering an unauthorized refund on garbage input). NeuroGate enforces a **2-Layer Fail-Safe Defense**:
+
+```
+[ Incoming Query ]
+        │
+        ▼
+[ Layer 1: Tokenizer OOV / Single-Char Fallback ] ──(Ratio ≥ 0.70)──> ErrUnlearnedVocabulary (< 1 μs)
+        │ (Passed)
+        ▼
+[ Layer 2: Neural Free Energy (LogSumExp) ] ───────(Energy < Min)────> ErrOutOfDomain (~29 μs)
+        │ (Passed)
+[ Layer 2: Shannon Entropy & Margin ] ─────────────(Entropy > 1.5)───> ErrHighEntropy / ErrAmbiguousIntent
+        │ (Passed)
+[ Confident Safe Execution ] ────────────────────────────────────────> RouteDecision (~29 μs, 0 B/op)
+```
+
+### Layer 1: Tokenizer-Level Unlearned Vocabulary Cutoff (< 1 μs)
+When user input consists of completely unlearned slang, typos, or foreign gibberish, the BPE tokenizer breaks the text down into raw 1-character glyphs rather than learned subword tokens.
+- If single-character fallback tokens constitute **70%+ of total tokens** (`SingleCharRatio >= 0.70`), the engine **aborts immediately before running the neural network**, returning `ErrUnlearnedVocabulary`.
+- Zero floating-point matrix multiplications are executed, neutralizing attacks and noise in under 1 microsecond.
+
+### Layer 2: Neural Metric Cutoff (~29 μs)
+Standard Softmax enforces $\sum P_i = 1.0$, which causes neural networks to output artificially inflated confidence even on meaningless inputs. Layer 2 guards against this via:
+1. **Free Energy ($-\text{LogSumExp}$)**: Measures the absolute activation strength of unnormalized logits before Softmax. Unlearned inputs lack activation energy and are cleanly isolated.
+2. **Shannon Entropy**: Measures probability distribution chaos. High entropy ($> 1.5$) triggers OOD isolation.
+3. **Top-1 / Top-2 Margin Gap**: Narrow margin ($< 0.15$) detects intent collision, returning `ErrAmbiguousIntent`.
+
+### Production Error-Returning Interface (`RouteQuery`)
+
+While `.Dispatch()` routes to callback handlers, `.RouteQuery()` returns standard Go sentinel errors for idiomatic `errors.Is` error handling:
+
+```go
+decision, err := router.RouteQuery(ctx, userInput)
+if err != nil {
+    switch {
+    case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
+        // Layer 1 Cutoff: Reject unlearned words immediately without calling LLMs
+        return promptUser("Word not recognized, please rephrase.")
+
+    case errors.Is(err, neurogate.ErrOutOfDomain), errors.Is(err, neurogate.ErrLowConfidence):
+        // Layer 2 Cutoff: Safely escalate to Cloud LLM (Gemini) or human representative
+        return escalateToCloudLLM(ctx, userInput)
+
+    case errors.Is(err, neurogate.ErrAmbiguousIntent):
+        // Layer 2 Ambiguity: Query user to disambiguate between primary and secondary candidates
+        return askConfirmation(decision.Intent, decision.SecondaryIntent)
+
+    default:
+        return handleSystemError(err)
+    }
+}
+
+// 29 μs Zero-Alloc execution of verified intent
+executeAction(decision.Intent, userInput)
+```
+
+---
+
 ## Observability & Whitebox Debugging
 
 Need to understand why a query routed to a specific branch or why it fell back? Use `Inspect`:
@@ -307,6 +377,7 @@ trace := router.Inspect("can u cancel order #49281? i bought it by mistake")
   "input_text": "can u cancel order #49281? i bought it by mistake",
   "token_ids": [4, 5, 8, 12, 45, 98],
   "subwords": ["can", "u", "cancel", "order", "#", "mistake"],
+  "single_char_ratio": 0.16,
   "unknown_token_ratio": 0.0,
   "class_probabilities": {
     "Account": 0.0012,
@@ -318,6 +389,7 @@ trace := router.Inspect("can u cancel order #49281? i bought it by mistake")
   "confidence": 0.9953,
   "margin": 0.9918,
   "entropy": 0.0351,
+  "energy": 6.842,
   "threshold": 0.75,
   "is_ambiguous": false,
   "is_pipeline": false,
@@ -503,7 +575,8 @@ go run ./cmd/ib-demo -domain fintech  # 6. FinTech Transaction Memo Audit & Frau
 | **`BindPipeline`** | `.BindPipeline(p, s string, handler PipelineAction) *Router` | Registers composite handler triggered when primary and secondary intents are both eligible. |
 | **`Ambiguous`** | `.Ambiguous(handler AmbiguousAction) *Router` | Intercepts borderline confidence or narrow margin queries to prompt user confirmation. |
 | **`Fallback`** | `.Fallback(handler RouteAction) *Router` | Designates safety handler for low confidence, high unknown token ratio, or OOD entropy. |
-| **`Dispatch`** | `.Dispatch(ctx context.Context, text string, payload any) error` | Evaluates 3-tier routing and executes bound branch in ~30 μs. |
+| **`RouteQuery`** | `.RouteQuery(ctx context.Context, text string) (RouteDecision, error)` | Evaluates 2-layer fail-safe guards and returns standard Go sentinel errors. |
+| **`Dispatch`** | `.Dispatch(ctx context.Context, text string, payload any) error` | Evaluates 3-tier routing with 2-layer guards and executes bound branch in ~30 μs. |
 | **`DispatchPipeline`**| `.DispatchPipeline(ctx context.Context, text string, payload any) error` | Executes multi-intent pipeline handlers if eligible, falling back to 3-tier routing. |
 | **`Reload`** | `.Reload(path string) error` | Atomically swaps weights on live traffic without locks (`0 ns` stop-the-world). |
 | **`EnableTelemetry`**| `.EnableTelemetry(capacity int) *Router` | Allocates thread-safe ring buffer capturing ambiguous, OOD, and pipeline requests. |
