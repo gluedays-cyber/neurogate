@@ -1,6 +1,9 @@
 ﻿# NeuroGate
 
 <p align="center">
+  <img src="assets/neurogate-hero.svg" width="100%" alt="NeuroGate vs Retro Branching — Electric Hyperbike vs Rusty Bicycle">
+</p>
+<p align="center">
   <strong>Directly Creates and Runs Its Own Neural AI in Pure Go</strong><br>
   <em>Stop borrowing third-party AIs. This engine creates its own domain artificial intelligence from scratch in 1.5 seconds, routing execution flow in ~30 μs with 0 B/op (Zero Allocations), Zero Downloads, and Zero CGO.</em>
 </p>
