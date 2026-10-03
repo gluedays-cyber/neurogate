@@ -14,8 +14,17 @@ var (
 	// MagicBytes is the 4-byte signature at the beginning of an IntelliBranch binary model ("IBRN").
 	MagicBytes = [4]byte{'I', 'B', 'R', 'N'}
 
-	// CurrentFormatVersion defines the supported serialization format version (v2 supports Positional Embeddings).
-	CurrentFormatVersion uint32 = 2
+	// FormatVersion1 defines the initial format version.
+	FormatVersion1 uint32 = 1
+
+	// FormatVersion2 defines the format version with Positional Embeddings support.
+	FormatVersion2 uint32 = 2
+
+	// FormatVersion3 defines the format version with Self-Calibrating Manifold Metadata.
+	FormatVersion3 uint32 = 3
+
+	// CurrentFormatVersion defines the active serialization format version.
+	CurrentFormatVersion uint32 = 3
 
 	ErrInvalidMagic     = errors.New("invalid binary format: missing IBRN magic header")
 	ErrUnsupportedVer   = errors.New("unsupported model format version")
@@ -25,14 +34,17 @@ var (
 	ErrEmptyInput       = errors.New("input token slice cannot be empty")
 )
 
-// Header contains the structural hyperparameters of the embedded neural model.
+// Header contains the structural hyperparameters and self-calibrating metadata of the embedded neural model.
 type Header struct {
-	Magic        [4]byte
-	Version      uint32
-	VocabSize    uint32
-	EmbeddingDim uint32
-	HiddenDim    uint32
-	NumClasses   uint32
+	Magic               [4]byte
+	Version             uint32
+	VocabSize           uint32
+	EmbeddingDim        uint32
+	HiddenDim           uint32
+	NumClasses          uint32
+	CalibratedMinEnergy float32 // Version 3+: Threshold for LogSumExp OOD gate
+	CalibratedMargin    float32 // Version 3+: Adaptive ambiguity margin threshold
+	CalibratedMinCosine float32 // Version 3+: Adaptive cosine similarity threshold
 }
 
 // MergeRule represents a pair-to-target token merge rule for BPE.
@@ -100,6 +112,17 @@ func SerializeModel(w io.Writer, model *InferenceModel) error {
 	}
 	if err := binary.Write(mw, binary.LittleEndian, model.Header.NumClasses); err != nil {
 		return err
+	}
+	if model.Header.Version >= FormatVersion3 {
+		if err := binary.Write(mw, binary.LittleEndian, model.Header.CalibratedMinEnergy); err != nil {
+			return err
+		}
+		if err := binary.Write(mw, binary.LittleEndian, model.Header.CalibratedMargin); err != nil {
+			return err
+		}
+		if err := binary.Write(mw, binary.LittleEndian, model.Header.CalibratedMinCosine); err != nil {
+			return err
+		}
 	}
 
 	// 2. Write Labels Block
@@ -203,8 +226,8 @@ func DeserializeModel(r io.Reader) (*InferenceModel, error) {
 	if err := binary.Read(tr, binary.LittleEndian, &header.Version); err != nil {
 		return nil, err
 	}
-	if header.Version != 1 && header.Version != 2 {
-		return nil, fmt.Errorf("%w: got %d, expected version 1 or 2", ErrUnsupportedVer, header.Version)
+	if header.Version != FormatVersion1 && header.Version != FormatVersion2 && header.Version != FormatVersion3 {
+		return nil, fmt.Errorf("%w: got %d, expected version 1, 2, or 3", ErrUnsupportedVer, header.Version)
 	}
 
 	if err := binary.Read(tr, binary.LittleEndian, &header.VocabSize); err != nil {
@@ -218,6 +241,17 @@ func DeserializeModel(r io.Reader) (*InferenceModel, error) {
 	}
 	if err := binary.Read(tr, binary.LittleEndian, &header.NumClasses); err != nil {
 		return nil, err
+	}
+	if header.Version >= FormatVersion3 {
+		if err := binary.Read(tr, binary.LittleEndian, &header.CalibratedMinEnergy); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(tr, binary.LittleEndian, &header.CalibratedMargin); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(tr, binary.LittleEndian, &header.CalibratedMinCosine); err != nil {
+			return nil, err
+		}
 	}
 
 	// 2. Read Labels Block

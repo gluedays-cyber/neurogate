@@ -137,7 +137,8 @@ func NewRouter(weightsPath string, defaultThreshold float64) (*Router, error)
   - `weightsPath` (`string`): Absolute or relative filesystem path to the compiled `.bin` file.
   - `defaultThreshold` (`float64`): Primary confidence threshold (recommended: `0.70` – `0.80`).
 - **Guarantees**:
-  - Validates `IBRN` 4-byte magic header and format version (`0x0001` or `0x0002` positional).
+  - Validates `IBRN` 4-byte magic header and format version (`0x0001`, `0x0002` positional, or `0x0003` self-calibrating).
+  - Automatically loads and applies embedded self-calibrated thresholds (`MinLogSumExp`, `RawLogitMargin`) if present in v3 header.
   - Verifies SHA-256 binary integrity checksum against tampering.
   - Initializes `sync/atomic.Pointer[InferenceModel]` for lock-free hot swapping.
   - Instantiates default 3-tier `DispatchPolicy` and thread-safe telemetry ring buffer.
@@ -587,6 +588,29 @@ gate.Bind("Refund", handleRefund).
     WithAnchor(2.0, "refund", "moneyback").
     Inhibit(1.5, "Delivery", "Account") // Subtracts 1.5 from Delivery and Account logits
 ```
+
+#### 5. Strict Short-Circuit Evaluation Order: OOD Before Ambiguity
+
+In edge cases involving novel, unlearned, or random inputs, a naive routing engine can incorrectly flag queries as `Ambiguous (ClassA vs ClassB)` with `isOOD: false` if both classes happen to have close but low logits. 
+
+NeuroGate enforces a **strict short-circuit evaluation pipeline**:
+1. **OOD Interception First**: The engine first evaluates:
+   - Geometric L2 Cosine Distance ($\cos(\theta) < \text{MinCosine}$)
+   - Tokenizer single-character fallback ratio ($\text{Ratio} \ge 0.85$)
+   - Free Energy / LogSumExp ($\text{Energy} < \text{MinEnergy}$)
+   - Shannon Entropy ($\text{Entropy} > \text{MaxEntropy}$)
+   - Excessive unknown token ratio ($\text{UnkRatio} \ge 0.50$)
+   If any of these conditions are breached, the query is immediately intercepted and routed to `Fallback` with `isOOD = true`.
+2. **Ambiguity Gating Second**: Top-1/Top-2 margin gap, raw logit margin, and co-activation density checks are executed **only on inputs verified to be within domain distribution**.
+
+#### 6. Format v3: Zero-Configuration Self-Calibrating Metadata
+
+Under Format Version 3 (`0x0003`), calling `gate.CalibrateDomainDistribution(samples, k)` automatically writes the optimal calibrated boundaries directly into the model binary header:
+- `CalibratedMinEnergy`: Adaptive LogSumExp free-energy threshold ($\mu_E - k\cdot\sigma_E$)
+- `CalibratedMargin`: Adaptive inter-class raw logit margin based on minimum centroid distance
+- `CalibratedMinCosine`: Adaptive cosine similarity cutoff ($\mu_{\cos} - k\cdot\sigma_{\cos}$)
+
+When any downstream service calls `NewRouter` or `NewNeuroGate`, these parameters are automatically loaded and applied without requiring any manual calibration code or configuration files.
 
 ---
 
@@ -1109,14 +1133,17 @@ NeuroGate models are compiled into a custom, compact Little-Endian binary (`.bin
 
 ```text
 +-------------------------------------------------------------------------------+
-|                        IBRN HEADER BLOCK (24 Bytes)                           |
+|                        IBRN HEADER BLOCK (24 Bytes v1/v2, 36 Bytes v3)        |
 +-------------------+-------------------+-------------------+-------------------+
 |  Magic ("IBRN")   |  Version (uint32) | VocabSize (uint32)| EmbeddingD(uint32)|
 |     [0x00 - 0x03] |     [0x04 - 0x07] |     [0x08 - 0x0B] |     [0x0C - 0x0F] |
 +-------------------+-------------------+-------------------+-------------------+
-| HiddenDim (uint32)| NumClasses(uint32)|                                       |
-|     [0x10 - 0x13] |     [0x14 - 0x17] |                                       |
+| HiddenDim (uint32)| NumClasses(uint32)| CalibEnergy(v3)   | CalibMargin(v3)   |
+|     [0x10 - 0x13] |     [0x14 - 0x17] |     [0x18 - 0x1B] |     [0x1C - 0x1F] |
 +-------------------+-------------------+-------------------+-------------------+
+| CalibCosine(v3)   |                                                           |
+|     [0x20 - 0x23] |                                                           |
++-------------------+-----------------------------------------------------------+
 |                        CLASS LABELS BLOCK                                     |
 |  For each class: Length (uint32) + UTF-8 string bytes                         |
 +-------------------------------------------------------------------------------+
@@ -1132,14 +1159,17 @@ NeuroGate models are compiled into a custom, compact Little-Endian binary (`.bin
 |  3. Layer 1 Bias      : HiddenDim * 4 bytes                                   |
 |  4. Layer 2 Weights   : HiddenDim * NumClasses * 4 bytes                      |
 |  5. Layer 2 Bias      : NumClasses * 4 bytes                                  |
-|  6. Positional (v2)   : MaxPositions (32) * EmbeddingDim * 4 bytes (v2 only)  |
+|  6. Positional (v2/v3): MaxPositions (32) * EmbeddingDim * 4 bytes            |
 +-------------------------------------------------------------------------------+
 |                        INTEGRITY TRAILER (32 Bytes)                           |
 |  SHA-256 Checksum over all preceding bytes [TotalLen-32 : TotalLen]           |
 +-------------------------------------------------------------------------------+
 ```
 
-- **Format Compatibility**: Fully backward-compatible. Version `0x0001` reads blocks 1–5; Version `0x0002` embeds 32 positional vectors (block 6) for word-order XOR disambiguation.
+- **Format Compatibility**: Fully backward-compatible across three generations:
+  - Version `0x0001` (v1 legacy): Standard dense weights (blocks 1–5).
+  - Version `0x0002` (v2 positional): Embeds 32 positional vectors (block 6) for word-order XOR disambiguation.
+  - Version `0x0003` (v3 self-calibrating): Expands header to 36 bytes with embedded `CalibratedMinEnergy`, `CalibratedMargin`, and `CalibratedMinCosine` for zero-configuration portability. Legacy v1 and v2 files are parsed seamlessly without errors.
 - **Endianness**: Explicitly Little-Endian (`encoding/binary.LittleEndian`). Safe for cross-compiling on ARM64 and AMD64 architectures.
 - **Integrity Verification**: `crypto/sha256` recalculates the checksum during `LoadBinaryModel()`. Any bit rot, truncation, or malicious tampering results in an immediate `ErrChecksumFailed` halt.
 - **Numerical Finite Verification**: Beyond SHA-256 integrity, `DeserializeModel()` performs linear validation over all IEEE 754 float32 slices to guarantee the absence of `NaN` or `±Inf` values. Corrupted models from divergent training runs are immediately rejected with `ErrCorruptedTensor`, preventing poisoned runtime calculations.

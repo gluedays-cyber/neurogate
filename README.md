@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v2.7.0_Hardened-purple.svg" alt="Release v2.7.0">
+  <img src="https://img.shields.io/badge/Release-v2.8.0_Modular-purple.svg" alt="Release v2.8.0">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Latency-~30_μs-brightgreen.svg" alt="Latency"></a>
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Allocs-0_B/op_(0_allocs)-blue.svg" alt="Allocations"></a>
-  <img src="https://img.shields.io/badge/Wire_Format-v2_Positional-orange.svg" alt="Format v2">
+  <img src="https://img.shields.io/badge/Wire_Format-v3_Self--Calibrating-orange.svg" alt="Format v3">
   <img src="https://img.shields.io/badge/CGO-Zero_Disabled-success.svg" alt="CGO Zero">
   <img src="https://img.shields.io/badge/Go-1.21+-00ADD8.svg" alt="Go Version">
   <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg" alt="License">
@@ -317,27 +317,41 @@ In mission-critical backends, forced misclassification of unlearned words, repet
 [ Incoming Query ]
         │
         ▼
-[ Layer 1: Tokenizer OOV & Repetitive Flood Guard ] ──(SingleChar ≥ 0.70)──> ErrUnlearnedVocabulary (< 1 μs)
+[ Layer 1: Tokenizer OOV & Repetitive Flood Guard ] ──(SingleChar ≥ 0.85)──> ErrUnlearnedVocabulary (< 1 μs)
         │                                           ──(UniqueRatio < 0.25)──> ErrDegeneratedInput    (< 1 μs)
         │ (Passed)
         ▼
-[ Layer 2: Neural Free Energy (LogSumExp) ] ──────────(Energy < Min)───────> ErrOutOfDomain (~29 μs)
-        │ (Passed)
-[ Layer 2: Shannon Entropy & Margin ] ────────────────(Entropy > 1.5)──────> ErrHighEntropy / ErrAmbiguousIntent
-        │ (Passed)
+[ Layer 2 Guard: Strict Short-Circuit OOD Interception ]
+  1. Geometric L2 Cosine Out-of-Domain Guard ───────(Cosine < MinCosine)─> ErrOutOfDomain / Fallback
+  2. Neural Free Energy (LogSumExp) ────────────────(Energy < MinEnergy)─> ErrOutOfDomain / Fallback
+  3. Shannon Distribution Entropy ──────────────────(Entropy > MaxEntropy)─> ErrHighEntropy / Fallback
+  4. Excessive Unknown Tokens (≥ 0.50) ─────────────(UnkRatio ≥ 0.50)───> ErrOutOfDomain / Fallback
+        │ (In-Distribution Confirmed)
+        ▼
+[ Layer 2 Ambiguity & Multi-Intent Decision ]
+  - Top-1 Probability Margin (< MarginCutoff) ──────> ErrAmbiguousIntent / Ambiguous Handler
+  - Raw Logit Margin (< RawLogitMargin) ────────────> ErrAmbiguousIntent / Ambiguous Handler
+  - Multi-Intent Co-Activation (CoActive ≥ 2) ──────> 1.5x Margin Tightening or Multi-Intent Pipeline
+  - Low Confidence (< LowThreshold) ────────────────> ErrLowConfidence / Fallback
+        │ (Confident Single Intent)
+        ▼
 [ Confident Safe Execution ] ───────────────────────────────────────────────> RouteDecision (~29 μs, 0 B/op)
 ```
 
 ### Layer 1: Tokenizer-Level Unlearned Vocabulary & Flood Cutoff (< 1 μs)
 Before invoking any neural forward arithmetic, Layer 1 executes two zero-allocation pre-checks:
-1. **Unlearned Fragment Cutoff (`SingleCharRatio >= 0.70`)**: If unlearned slang or gibberish causes BPE to fragment 70%+ of tokens into single-byte glyphs, the engine halts immediately with `ErrUnlearnedVocabulary`.
+1. **Unlearned Fragment Cutoff (`SingleCharRatio >= 0.85`)**: If unlearned slang or gibberish causes BPE to fragment 85%+ of tokens into single-byte glyphs, the engine halts immediately with `ErrUnlearnedVocabulary`.
 2. **Repetitive Token Flood Guard (`UniqueTokenRatio < 0.25`)**: Repeatedly spamming a valid in-domain word (e.g. *"refund refund refund refund..."*) attempts to bypass OOD centroid guards. Layer 1 detects degenerated inputs with low unique token ratios and isolates them immediately with `ErrDegeneratedInput`.
 
-### Layer 2: Neural Metric Cutoff (~29 μs)
-Standard Softmax enforces $\sum P_i = 1.0$, which causes neural networks to output artificially inflated confidence even on meaningless inputs. Layer 2 guards against this via:
-1. **Free Energy ($-\text{LogSumExp}$)**: Measures the absolute activation strength of unnormalized logits before Softmax. Unlearned inputs lack activation energy and are cleanly isolated.
-2. **Shannon Entropy**: Measures probability distribution chaos. High entropy ($> 1.5$) triggers OOD isolation.
-3. **Top-1 / Top-2 Margin Gap**: Narrow margin ($< 0.15$) detects intent collision, returning `ErrAmbiguousIntent`.
+### Layer 2: Strict Short-Circuit Evaluation Order (OOD Before Ambiguity) (~29 μs)
+Standard Softmax enforces $\sum P_i = 1.0$, which causes neural networks to output artificially inflated confidence even on meaningless inputs. To eliminate edge cases where novel unlearned inputs are erroneously flagged as "Ambiguous" between two arbitrary classes, NeuroGate enforces a **strict short-circuit evaluation order**:
+1. **Geometric L2 Cosine OOD Guard**: If the input's normalized embedding vector falls outside the domain manifold radius ($\cos(\theta) < \text{MinCosine}$), the request is immediately rejected as OOD.
+2. **Free Energy ($-\text{LogSumExp}$)**: Measures the absolute activation strength of unnormalized logits before Softmax. Unlearned inputs lack activation energy and are cleanly isolated before ambiguity checks.
+3. **Shannon Entropy**: Measures probability distribution chaos. High entropy ($> 2.0$) triggers OOD isolation.
+4. **Ambiguity & Logit Margin (Only for Confirmed In-Distribution Inputs)**: Only once in-domain membership is mathematically established, the engine evaluates probability margin ($< 0.15$), raw logit gap ($< \text{RawLogitMargin}$), and co-activation density (`CoActiveCount >= 2`).
+
+### Format v3: Zero-Configuration Self-Calibrating Metadata
+Under Format Version 3 (`0x0003`), `CalibrateDomainDistribution` automatically embeds calibrated domain boundaries (`CalibratedMinEnergy`, `CalibratedMargin`, `CalibratedMinCosine`) directly into the model binary header. Any microservice loading the `.bin` file instantly inherits production-calibrated thresholds with **zero manual configuration code**.
 
 ### Deserialization Guard: Finite Tensor Verification (`math.IsNaN`, `math.IsInf`)
 Beyond SHA-256 integrity checksums, `DeserializeModel` actively validates all loaded tensor weights (`Embedding`, `Positional`, `W1`, `B1`, `W2`, `B2`). Any non-finite float value resulting from divergence during training is immediately rejected with `ErrCorruptedTensor`, preventing poisoned runtime states.
@@ -665,17 +679,23 @@ NeuroGate - lib/
 ├── docs/
 │   └── MANUAL.md          # Comprehensive manual, keyword guide & tutorial
 ├── pkg/
-│   └── neurogate/         # Pure-Go zero-dependency core engine
-│       ├── binary.go      # Format v1 & v2 Little-Endian parser and serializer
+│   └── neurogate/         # Pure-Go zero-dependency modular core engine
+│       ├── anchor.go      # Symbolic anchors, asymmetric inhibition & fluent builder
+│       ├── binary.go      # Format v1, v2 & v3 (Self-Calibrating) Little-Endian serializer
+│       ├── calibration.go # Domain centroid, dispersion & adaptive margin calibration
+│       ├── evaluator.go   # Zero-allocation 3-head gate evaluator & 3-tier filter execution
+│       ├── facade.go      # High-level zero-boilerplate APIs (Open, OpenOrTrain, Train)
+│       ├── neurogate.go   # 3-Head geometric filter core, configuration & diagnostics
 │       ├── ops.go         # SafeClamp, GELU, Softmax, MatMul, and Non-Linear Pooling
-│       ├── runtime.go     # Zero-alloc PredictSlots, Shannon Entropy & In-memory model
+│       ├── policy.go      # 3-Tier routing policies, thresholds & handler type signatures
+│       ├── router.go      # Router core lifecycle, atomic reload & handler registration
+│       ├── router_dispatch.go # Fail-safe query routing & multi-intent pipeline dispatch
+│       ├── runtime.go     # Zero-alloc PredictSlots, Shannon Entropy & in-memory model
 │       ├── telemetry.go   # Thread-safe ring buffer for active learning feedback
 │       ├── tokenizer.go   # Pure Go BPE subword tokenizer
-│       ├── trainer.go     # AdamW backprop trainer with positional embedding learning
-│       ├── router.go      # 3-Tier router, atomic reload, and pipeline dispatch
-│       ├── neurogate.go   # 3-Head geometric filter, cosine manifold & symbolic anchors
-│       └── facade.go      # High-level zero-boilerplate APIs (Open, OpenOrTrain, Train)
-├── neurogate.go       # Root library export facade (import "neurogate")
+│       ├── trace.go       # RouteDecision, RouteTrace & GateTrace telemetry structures
+│       └── trainer.go     # AdamW backprop trainer with positional embedding learning
+├── neurogate.go           # Root library export facade (import "neurogate")
 ├── go.mod                 # Go module definition (pure library)
 ├── LICENSE                # MIT License
 └── README.md              # Project documentation

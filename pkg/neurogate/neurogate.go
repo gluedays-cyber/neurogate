@@ -18,137 +18,22 @@ const (
 
 	// MaxGateEmbDim defines the maximum supported embedding dimension for zero-allocation stack buffers.
 	MaxGateEmbDim = 64
-
-	// DefaultMaxAnchorBoost defines the default maximum cumulative logit boost per class (prevents logit explosion).
-	DefaultMaxAnchorBoost float32 = 3.0
 )
 
 var (
-	ErrNeuroGateModelNil = errors.New("neurogate: underlying model is nil")
+	ErrNeuroGateModelNil  = errors.New("neurogate: underlying model is nil")
 	ErrClassLimitExceeded = errors.New("neurogate: registered classes exceed MaxGateClasses")
 )
-
-// AnchorRule defines a symbolic soft-bias injected into a specific class logit upon bitmask match.
-type AnchorRule struct {
-	ClassIndex     int
-	Mask           uint64
-	Weight         float32
-	InhibitClasses []int
-	Penalty        float32
-	Keywords       []string
-}
-
-// GateTrace captures comprehensive runtime metrics across all three geometric heads.
-type GateTrace struct {
-	InputText          string             `json:"input_text"`
-	TokenIDs           []uint32           `json:"token_ids"`
-	Subwords           []string           `json:"subwords"`
-	UnknownTokenRatio  float64            `json:"unknown_token_ratio"`
-	CosineSimilarity   float32            `json:"cosine_similarity"`
-	IsOOD              bool               `json:"is_ood"`
-	AnchorBitmask      uint64             `json:"anchor_bitmask"`
-	TriggeredAnchors   []string           `json:"triggered_anchors"`
-	ClassProbabilities map[string]float32 `json:"class_probabilities"`
-	PredictedLabel     string             `json:"predicted_label"`
-	SecondaryLabel     string             `json:"secondary_label,omitempty"`
-	Confidence         float64            `json:"confidence"`
-	Margin             float64            `json:"margin"`
-	LogitMargin        float32            `json:"logit_margin"`
-	CoActiveCount      uint8              `json:"co_active_count"`
-	Entropy            float64            `json:"entropy"`
-	LogSumExp          float64            `json:"log_sum_exp"`
-	FreeEnergy         float64            `json:"free_energy"`
-	Threshold          float64            `json:"threshold"`
-	IsAmbiguous        bool               `json:"is_ambiguous"`
-	IsPipeline         bool               `json:"is_pipeline"`
-	IsFallback         bool               `json:"is_fallback"`
-	FallbackReason     string             `json:"fallback_reason,omitempty"`
-	LatencyMicros      int64              `json:"latency_micros"`
-}
-
-// GateRouteBuilder provides fluent API chaining for binding routes and anchor soft biases.
-type GateRouteBuilder struct {
-	gate       *NeuroGate
-	classIndex int
-	label      string
-}
-
-// WithAnchor registers anchor keywords that inject a soft additive bias into this class's logit.
-func (b *GateRouteBuilder) WithAnchor(weight float32, keywords ...string) *GateRouteBuilder {
-	b.gate.mu.Lock()
-	defer b.gate.mu.Unlock()
-
-	var mask uint64 = 0
-	var cleanKeywords []string
-	for _, kw := range keywords {
-		kw = strings.TrimSpace(strings.ToLower(kw))
-		if kw == "" {
-			continue
-		}
-		cleanKeywords = append(cleanKeywords, kw)
-		m, exists := b.gate.anchorDict[kw]
-		if !exists {
-			if len(b.gate.anchorDict) < 64 {
-				m = 1 << uint64(len(b.gate.anchorDict))
-				b.gate.anchorDict[kw] = m
-			}
-		}
-		mask |= m
-	}
-
-	model := b.gate.model.Load()
-	if model != nil && model.Tokenizer != nil {
-		for _, kw := range cleanKeywords {
-			toks := model.Tokenizer.Encode(kw)
-			for _, tid := range toks {
-				b.gate.anchorTokenMap[tid] |= mask
-			}
-		}
-	}
-
-	b.gate.anchorRules = append(b.gate.anchorRules, AnchorRule{
-		ClassIndex: b.classIndex,
-		Mask:       mask,
-		Weight:     weight,
-		Keywords:   cleanKeywords,
-	})
-	return b
-}
-
-// Inhibit registers competing class labels to penalize when this anchor triggers.
-func (b *GateRouteBuilder) Inhibit(penalty float32, competingLabels ...string) *GateRouteBuilder {
-	b.gate.mu.Lock()
-	defer b.gate.mu.Unlock()
-
-	if len(b.gate.anchorRules) == 0 {
-		return b
-	}
-	lastIdx := len(b.gate.anchorRules) - 1
-	rule := &b.gate.anchorRules[lastIdx]
-
-	for _, lbl := range competingLabels {
-		if cIdx, exists := b.gate.labelToIndex[lbl]; exists {
-			rule.InhibitClasses = append(rule.InhibitClasses, cIdx)
-		}
-	}
-	rule.Penalty = penalty
-	return b
-}
-
-// Bind allows continuing chaining for additional routes.
-func (b *GateRouteBuilder) Bind(label string, handler RouteAction) *GateRouteBuilder {
-	return b.gate.Bind(label, handler)
-}
 
 // NeuroGate coordinates a single shared neural backbone with a geometric 3-head zero-allocation gate.
 type NeuroGate struct {
 	model atomic.Pointer[InferenceModel]
 
-	mu             sync.RWMutex
-	labels         [MaxGateClasses]string
-	routes         [MaxGateClasses]RouteAction
-	classCount     int
-	labelToIndex   map[string]int
+	mu           sync.RWMutex
+	labels       [MaxGateClasses]string
+	routes       [MaxGateClasses]RouteAction
+	classCount   int
+	labelToIndex map[string]int
 
 	anchorDict     map[string]uint64
 	anchorTokenMap map[uint32]uint64
@@ -161,10 +46,10 @@ type NeuroGate struct {
 	domainMeanSim  float32
 	domainStdDev   float32
 
-	policy         DispatchPolicy
-	pipelines      map[string]PipelineAction
-	ambiguous      AmbiguousAction
-	fallback       RouteAction
+	policy    DispatchPolicy
+	pipelines map[string]PipelineAction
+	ambiguous AmbiguousAction
+	fallback  RouteAction
 }
 
 // NewNeuroGate loads an InferenceModel from disk and prepares a high-performance NeuroGate.
@@ -200,6 +85,17 @@ func NewNeuroGateWithModel(model *InferenceModel) *NeuroGate {
 		gate.classCount++
 	}
 
+	// Apply self-calibrated thresholds from binary header if present
+	if model.Header.CalibratedMinEnergy > 0 {
+		gate.policy.MinLogSumExp = float64(model.Header.CalibratedMinEnergy)
+	}
+	if model.Header.CalibratedMargin > 0 {
+		gate.policy.RawLogitMargin = model.Header.CalibratedMargin
+	}
+	if model.Header.CalibratedMinCosine != 0 {
+		gate.minCosineSim = model.Header.CalibratedMinCosine
+	}
+
 	// Auto-compute baseline domain centroid from valid vocabulary embeddings
 	gate.computeBaselineCentroid(model)
 
@@ -209,240 +105,6 @@ func NewNeuroGateWithModel(model *InferenceModel) *NeuroGate {
 	}
 
 	return gate
-}
-
-// computeBaselineCentroid derives an initial normalized centroid from the model's vocabulary embeddings.
-func (g *NeuroGate) computeBaselineCentroid(model *InferenceModel) {
-	embDim := int(model.Header.EmbeddingDim)
-	if embDim > MaxGateEmbDim || embDim == 0 || len(model.Weights.Embedding) == 0 {
-		return
-	}
-
-	var sum [MaxGateEmbDim]float64
-	validTokens := 0
-	for tokID, word := range model.Vocab {
-		if word == "[PAD]" || word == "[UNK]" {
-			continue
-		}
-		offset := tokID * embDim
-		if offset+embDim <= len(model.Weights.Embedding) {
-			for d := 0; d < embDim; d++ {
-				sum[d] += float64(model.Weights.Embedding[offset+d])
-			}
-			validTokens++
-		}
-	}
-
-	if validTokens > 0 {
-		inv := 1.0 / float64(validTokens)
-		var raw [MaxGateEmbDim]float32
-		for d := 0; d < embDim; d++ {
-			raw[d] = float32(sum[d] * inv)
-		}
-		L2Normalize(raw[:embDim], g.domainCentroid[:embDim])
-		g.hasCentroid = true
-	}
-}
-
-// CalibrateDomainCentroid calculates the true manifold center from sample dataset sentences.
-func (g *NeuroGate) CalibrateDomainCentroid(samples []DataSample) *NeuroGate {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	model := g.model.Load()
-	if model == nil || len(samples) == 0 {
-		return g
-	}
-
-	embDim := int(model.Header.EmbeddingDim)
-	if embDim > MaxGateEmbDim {
-		embDim = MaxGateEmbDim
-	}
-
-	var sum [MaxGateEmbDim]float64
-	validCount := 0
-	var pooled [MaxGateEmbDim]float32
-
-	var dummyLogits [MaxGateClasses]float32
-	for _, s := range samples {
-		tokens := model.Tokenizer.Encode(s.Text)
-		if len(tokens) == 0 {
-			continue
-		}
-		if err := model.PredictFeatures(tokens, pooled[:embDim], dummyLogits[:g.classCount]); err == nil {
-			for d := 0; d < embDim; d++ {
-				sum[d] += float64(pooled[d])
-			}
-			validCount++
-		}
-	}
-
-	if validCount > 0 {
-		inv := 1.0 / float64(validCount)
-		var raw [MaxGateEmbDim]float32
-		for d := 0; d < embDim; d++ {
-			raw[d] = float32(sum[d] * inv)
-		}
-		L2Normalize(raw[:embDim], g.domainCentroid[:embDim])
-		g.hasCentroid = true
-	}
-	return g
-}
-
-// CalibrateDomainDistribution calculates the manifold center and dynamically computes
-// the standard deviation of cosine similarities across sample embeddings to configure an adaptive OOD threshold:
-// minCosine = mean - (k * stdDev).
-func (g *NeuroGate) CalibrateDomainDistribution(samples []DataSample, k float32) *NeuroGate {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	model := g.model.Load()
-	if model == nil || len(samples) == 0 {
-		return g
-	}
-
-	embDim := int(model.Header.EmbeddingDim)
-	if embDim > MaxGateEmbDim {
-		embDim = MaxGateEmbDim
-	}
-
-	var sum [MaxGateEmbDim]float64
-	validCount := 0
-	var pooled [MaxGateEmbDim]float32
-	var dummyLogits [MaxGateClasses]float32
-
-	for _, s := range samples {
-		tokens := model.Tokenizer.Encode(s.Text)
-		if len(tokens) == 0 {
-			continue
-		}
-		if err := model.PredictFeatures(tokens, pooled[:embDim], dummyLogits[:g.classCount]); err == nil {
-			for d := 0; d < embDim; d++ {
-				sum[d] += float64(pooled[d])
-			}
-			validCount++
-		}
-	}
-
-	if validCount == 0 {
-		return g
-	}
-
-	inv := 1.0 / float64(validCount)
-	var raw [MaxGateEmbDim]float32
-	for d := 0; d < embDim; d++ {
-		raw[d] = float32(sum[d] * inv)
-	}
-	L2Normalize(raw[:embDim], g.domainCentroid[:embDim])
-	g.hasCentroid = true
-
-	// Pass 2: Calculate distribution variance and std dev of cosine similarities
-	var sumSim, sumSqSim float64
-	evalCount := 0
-	var normPooled [MaxGateEmbDim]float32
-	for _, s := range samples {
-		tokens := model.Tokenizer.Encode(s.Text)
-		if len(tokens) == 0 {
-			continue
-		}
-		if err := model.PredictFeatures(tokens, pooled[:embDim], dummyLogits[:g.classCount]); err == nil {
-			L2Normalize(pooled[:embDim], normPooled[:embDim])
-			sim := DotProduct(normPooled[:embDim], g.domainCentroid[:embDim])
-			sumSim += float64(sim)
-			sumSqSim += float64(sim * sim)
-			evalCount++
-		}
-	}
-
-	if evalCount > 0 {
-		n := float64(evalCount)
-		mean := float32(sumSim / n)
-		variance := float32((sumSqSim / n) - float64(mean*mean))
-		if variance < 0 {
-			variance = 0
-		}
-		stdDev := float32(math.Sqrt(float64(variance)))
-		g.domainMeanSim = mean
-		g.domainStdDev = stdDev
-
-		adaptiveMin := mean - (k * stdDev)
-		if adaptiveMin < -1.0 {
-			adaptiveMin = -1.0
-		}
-		g.minCosineSim = adaptiveMin
-	}
-
-	// Pass 3: Calculate Inter-Class Boundary Distance and Adaptive RawLogitMargin
-	classSums := make([][MaxGateEmbDim]float64, g.classCount)
-	classCounts := make([]int, g.classCount)
-	for _, s := range samples {
-		cIdx, exists := g.labelToIndex[s.Label]
-		if !exists || cIdx >= g.classCount {
-			continue
-		}
-		tokens := model.Tokenizer.Encode(s.Text)
-		if len(tokens) == 0 {
-			continue
-		}
-		if err := model.PredictFeatures(tokens, pooled[:embDim], dummyLogits[:g.classCount]); err == nil {
-			for d := 0; d < embDim; d++ {
-				classSums[cIdx][d] += float64(pooled[d])
-			}
-			classCounts[cIdx]++
-		}
-	}
-
-	classCentroids := make([][MaxGateEmbDim]float32, g.classCount)
-	for c := 0; c < g.classCount; c++ {
-		if classCounts[c] > 0 {
-			invC := 1.0 / float64(classCounts[c])
-			var rawC [MaxGateEmbDim]float32
-			for d := 0; d < embDim; d++ {
-				rawC[d] = float32(classSums[c][d] * invC)
-			}
-			L2Normalize(rawC[:embDim], classCentroids[c][:embDim])
-		}
-	}
-
-	minDist := float32(2.0)
-	validPairs := 0
-	for i := 0; i < g.classCount; i++ {
-		if classCounts[i] == 0 {
-			continue
-		}
-		for j := i + 1; j < g.classCount; j++ {
-			if classCounts[j] == 0 {
-				continue
-			}
-			sim := DotProduct(classCentroids[i][:embDim], classCentroids[j][:embDim])
-			dist := 1.0 - sim
-			if dist < minDist {
-				minDist = dist
-			}
-			validPairs++
-		}
-	}
-
-	if validPairs > 0 {
-		// Closely clustered classes require a stricter logit margin to disambiguate
-		adaptiveMargin := float32(0.50) * (2.0 - minDist)
-		if adaptiveMargin < 0.25 {
-			adaptiveMargin = 0.25
-		}
-		if adaptiveMargin > 1.20 {
-			adaptiveMargin = 1.20
-		}
-		g.policy.RawLogitMargin = adaptiveMargin
-	}
-
-	return g
-}
-
-// DomainStats returns the calibrated manifold distribution metrics.
-func (g *NeuroGate) DomainStats() (hasCentroid bool, meanSim float32, stdDev float32, minCosine float32) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return g.hasCentroid, g.domainMeanSim, g.domainStdDev, g.minCosineSim
 }
 
 // SetMaxAnchorBoost sets the maximum cumulative soft-bias logit boost allowed per class (prevents logit explosion).
@@ -481,6 +143,11 @@ func (g *NeuroGate) SetMinCosineSim(threshold float32) *NeuroGate {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.minCosineSim = threshold
+	if threshold <= 0 {
+		g.hasCentroid = false
+	} else {
+		g.hasCentroid = true
+	}
 	return g
 }
 
@@ -500,25 +167,24 @@ func (g *NeuroGate) SetSingleCharRatioCutoff(cutoff float64) *NeuroGate {
 	return g
 }
 
-
 // SetTemperature configures the temperature scaling factor used in softmax calculations.
 func (g *NeuroGate) SetTemperature(t float32) *NeuroGate {
-    g.mu.Lock()
-    defer g.mu.Unlock()
-    if m := g.model.Load(); m != nil {
-        m.Temperature = t
-    }
-    return g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if m := g.model.Load(); m != nil {
+		m.Temperature = t
+	}
+	return g
 }
 
 // Temperature returns the current temperature scaling factor.
 func (g *NeuroGate) Temperature() float32 {
-    g.mu.RLock()
-    defer g.mu.RUnlock()
-    if m := g.model.Load(); m != nil {
-        return m.Temperature
-    }
-    return 0
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if m := g.model.Load(); m != nil {
+		return m.Temperature
+	}
+	return 0
 }
 
 // Bind registers an action handler for a target class label, returning a GateRouteBuilder for anchor chaining.
@@ -775,15 +441,24 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 	// -------------------------------------------------------------
 	var oodReason string
 
-	if g.hasCentroid && cosineSim < g.minCosineSim {
+	effectiveMinEnergy := g.policy.MinLogSumExp
+	if effectiveMinEnergy == 0 && model != nil && model.Header.CalibratedMinEnergy > 0 {
+		effectiveMinEnergy = float64(model.Header.CalibratedMinEnergy)
+	}
+	effectiveMinCosine := g.minCosineSim
+	if effectiveMinCosine == 0 && model != nil && model.Header.CalibratedMinCosine != 0 {
+		effectiveMinCosine = model.Header.CalibratedMinCosine
+	}
+
+	if g.hasCentroid && effectiveMinCosine > 0 && cosineSim < effectiveMinCosine {
 		isOOD = true
-		oodReason = fmt.Sprintf("cosine similarity %.4f below domain threshold %.4f (OOD)", cosineSim, g.minCosineSim)
+		oodReason = fmt.Sprintf("cosine similarity %.4f below domain threshold %.4f (OOD)", cosineSim, effectiveMinCosine)
 	} else if len(tokens) >= 2 && g.policy.MaxSingleCharRatio > 0 && singleRatio >= g.policy.MaxSingleCharRatio {
 		isOOD = true
 		oodReason = fmt.Sprintf("unlearned vocabulary (single-char ratio %.2f >= %.2f)", singleRatio, g.policy.MaxSingleCharRatio)
-	} else if g.policy.MinLogSumExp > 0 && logSumExp < g.policy.MinLogSumExp {
+	} else if effectiveMinEnergy > 0 && logSumExp < effectiveMinEnergy {
 		isOOD = true
-		oodReason = fmt.Sprintf("free energy %.4f (logSumExp %.4f) below in-distribution threshold %.4f (OOD)", freeEnergy, logSumExp, g.policy.MinLogSumExp)
+		oodReason = fmt.Sprintf("free energy %.4f (logSumExp %.4f) below in-distribution threshold %.4f (OOD)", freeEnergy, logSumExp, effectiveMinEnergy)
 	} else if entropy > g.policy.MaxEntropy {
 		isOOD = true
 		oodReason = fmt.Sprintf("prediction entropy %.4f exceeds limit %.4f (OOD)", entropy, g.policy.MaxEntropy)
@@ -820,11 +495,8 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 		trace.IsOOD = true
 		trace.IsFallback = true
 		trace.FallbackReason = oodReason
-	} else if trace.Confidence < g.policy.LowThreshold {
-		trace.IsFallback = true
-		trace.FallbackReason = fmt.Sprintf("confidence %.4f below low threshold %.4f", trace.Confidence, g.policy.LowThreshold)
 	} else {
-		// Multi-intent pipeline evaluation (Softmax probability OR dual-anchor co-activation)
+		// Multi-intent pipeline evaluation (Softmax probability, dual-anchor co-activation, or pre-softmax co-activation)
 		if secondLabel != "" {
 			pipeKey := pipelineKey(bestLabel, secondLabel)
 			_, hasPipeline := g.pipelines[pipeKey]
@@ -840,541 +512,32 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 				}
 			}
 			hasBothAnchors := primaryAnchors && secondaryAnchors
-			if calibratedSecond >= g.policy.PipelineThreshold || (hasBothAnchors && hasPipeline) {
+			isDualActivated := coActive >= 2 && adjustedLogits[secondIdx] >= DefaultActivationThreshold
+			if calibratedSecond >= g.policy.PipelineThreshold || (hasBothAnchors && hasPipeline) || (isDualActivated && hasPipeline) {
 				trace.IsPipeline = true
 			}
 		}
-		if trace.Confidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) || (coActive >= 2 && g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin*1.5) {
-			trace.IsAmbiguous = true
+
+		effectiveMargin := g.policy.RawLogitMargin
+		if effectiveMargin == 0 && model != nil && model.Header.CalibratedMargin > 0 {
+			effectiveMargin = model.Header.CalibratedMargin
 		}
+
+		isAmbiguous := trace.Confidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (effectiveMargin > 0.0 && logitMargin < effectiveMargin) || (coActive >= 2 && effectiveMargin > 0.0 && logitMargin < effectiveMargin*1.5)
+		if isAmbiguous {
+			trace.IsAmbiguous = true
+		} else if trace.Confidence < g.policy.LowThreshold {
+			trace.IsFallback = true
+			trace.FallbackReason = fmt.Sprintf("confidence %.4f below low threshold %.4f", trace.Confidence, g.policy.LowThreshold)
+		}
+
 		if g.routes[bestIdx] == nil {
 			trace.IsFallback = true
-			trace.FallbackReason = fmt.Sprintf("label '%s' has no bound route handler", bestLabel)
+			if trace.FallbackReason == "" {
+				trace.FallbackReason = fmt.Sprintf("label '%s' has no bound route handler", bestLabel)
+			}
 		}
 	}
 
 	return trace
 }
-
-type gateEvaluation struct {
-	primaryIdx   int
-	secondaryIdx int
-	isFallback   bool
-	isPipeline   bool
-	isAmbiguous  bool
-}
-
-// evaluateFast executes the 3-head gate on the stack without allocating diagnostic maps or traces.
-func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
-	if g.policy.EnablePatternGuard && ScanUnlearnedPatterns(text) {
-		return gateEvaluation{isFallback: true}
-	}
-
-	model := g.model.Load()
-	if model == nil {
-		return gateEvaluation{isFallback: true}
-	}
-
-	if len(text) > MaxInputBytes {
-		text = TruncateToRuneBoundary(text, MaxInputBytes)
-	}
-
-	tokens := model.Tokenizer.Encode(text)
-	if len(tokens) == 0 {
-		return gateEvaluation{isFallback: true}
-	}
-	if len(tokens) > MaxSequenceTokens {
-		tokens = tokens[:MaxSequenceTokens]
-	}
-
-	singleRatio, _ := model.Tokenizer.AnalyzeUnlearnedRatio(tokens)
-	if len(tokens) >= 2 && g.policy.MaxSingleCharRatio > 0 && singleRatio >= g.policy.MaxSingleCharRatio {
-		return gateEvaluation{isFallback: true}
-	}
-
-	unkCount := 0
-	unkID, hasUnk := model.Tokenizer.VocabMap["[UNK]"]
-	for _, id := range tokens {
-		if hasUnk && id == unkID {
-			unkCount++
-		}
-	}
-	unkRatio := float64(unkCount) / float64(len(tokens))
-
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	embDim := int(model.Header.EmbeddingDim)
-	if embDim > MaxGateEmbDim {
-		embDim = MaxGateEmbDim
-	}
-	numClasses := g.classCount
-
-	var pooledStack [MaxGateEmbDim]float32
-	var rawLogitsStack [MaxGateClasses]float32
-	var normPooled [MaxGateEmbDim]float32
-
-	_ = model.PredictFeatures(tokens, pooledStack[:embDim], rawLogitsStack[:numClasses])
-
-	// [Head 1]: L2 Cosine OOD Guard
-	L2Normalize(pooledStack[:embDim], normPooled[:embDim])
-	if g.hasCentroid {
-		cosineSim := DotProduct(normPooled[:embDim], g.domainCentroid[:embDim])
-		if cosineSim < g.minCosineSim {
-			return gateEvaluation{isFallback: true}
-		}
-	}
-
-	// [Head 2]: Anchor Bitmask & Symbolic Bias
-	var textBitmask uint64 = 0
-	lowerText := strings.ToLower(text)
-	for kw, mask := range g.anchorDict {
-		if strings.Contains(lowerText, kw) {
-			textBitmask |= mask
-		}
-	}
-
-	var adjustedLogits [MaxGateClasses]float32
-	copy(adjustedLogits[:numClasses], rawLogitsStack[:numClasses])
-	var classDeltas [MaxGateClasses]float32
-	for _, rule := range g.anchorRules {
-		matchedBits := textBitmask & rule.Mask
-		if matchedBits != 0 {
-			count := float32(bits.OnesCount64(matchedBits))
-			classDeltas[rule.ClassIndex] += rule.Weight * count
-			for _, inhClass := range rule.InhibitClasses {
-				if inhClass >= 0 && inhClass < numClasses {
-					classDeltas[inhClass] -= rule.Penalty * count
-				}
-			}
-		}
-	}
-	for c := 0; c < numClasses; c++ {
-		delta := classDeltas[c]
-		if delta > 0 && g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
-			delta = g.maxAnchorBoost
-		}
-		adjustedLogits[c] += delta
-	}
-
-	// Logit margin computation
-	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
-	var coActive uint8 = 0
-	for i := 0; i < numClasses; i++ {
-		l := adjustedLogits[i]
-		if l >= DefaultActivationThreshold {
-			coActive++
-		}
-		if l > maxLogit1 {
-			maxLogit2 = maxLogit1
-			maxLogit1 = l
-		} else if l > maxLogit2 {
-			maxLogit2 = l
-		}
-	}
-	var logitMargin float32 = 0.0
-	if numClasses >= 2 {
-		logitMargin = maxLogit1 - maxLogit2
-	}
-
-	// [Head 3]: Softmax, Margin, and Entropy
-	var probs [MaxGateClasses]float32
-	_ = Softmax(adjustedLogits[:numClasses], model.Temperature, probs[:numClasses])
-
-	var bestIdx, secondIdx int = 0, 1
-	var bestScore, secondScore float32 = -1.0, -1.0
-	for i := 0; i < numClasses; i++ {
-		p := probs[i]
-		if p > bestScore {
-			secondScore = bestScore
-			secondIdx = bestIdx
-			bestScore = p
-			bestIdx = i
-		} else if p > secondScore {
-			secondScore = p
-			secondIdx = i
-		}
-	}
-
-	calibratedConfidence := float64(bestScore) * (1.0 - unkRatio)
-	calibratedSecond := float64(secondScore) * (1.0 - unkRatio)
-	margin := calibratedConfidence - calibratedSecond
-	entropy := float64(computeEntropy(probs[:numClasses]))
-
-	// LogSumExp / Free Energy evaluation
-	var maxLogit float32 = adjustedLogits[0]
-	for i := 1; i < numClasses; i++ {
-		if adjustedLogits[i] > maxLogit {
-			maxLogit = adjustedLogits[i]
-		}
-	}
-	var sumExp float64
-	for i := 0; i < numClasses; i++ {
-		sumExp += math.Exp(float64(adjustedLogits[i] - maxLogit))
-	}
-	logSumExp := float64(maxLogit) + math.Log(sumExp)
-
-	if (g.policy.MinLogSumExp > 0 && logSumExp < g.policy.MinLogSumExp) ||
-		unkRatio >= 0.5 ||
-		calibratedConfidence < g.policy.LowThreshold ||
-		entropy > g.policy.MaxEntropy {
-		return gateEvaluation{isFallback: true, primaryIdx: bestIdx, secondaryIdx: secondIdx}
-	}
-
-	eval := gateEvaluation{
-		primaryIdx:   bestIdx,
-		secondaryIdx: secondIdx,
-	}
-
-	if secondIdx >= 0 {
-		pipeKey := pipelineKey(g.labels[bestIdx], g.labels[secondIdx])
-		_, hasPipeline := g.pipelines[pipeKey]
-		var primaryAnchors, secondaryAnchors bool
-		for _, rule := range g.anchorRules {
-			if (textBitmask & rule.Mask) != 0 {
-				if rule.ClassIndex == bestIdx {
-					primaryAnchors = true
-				}
-				if rule.ClassIndex == secondIdx {
-					secondaryAnchors = true
-				}
-			}
-		}
-		hasBothAnchors := primaryAnchors && secondaryAnchors
-		if calibratedSecond >= g.policy.PipelineThreshold || (hasBothAnchors && hasPipeline) {
-			eval.isPipeline = true
-		}
-	}
-	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) || (coActive >= 2 && g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin*1.5) {
-		eval.isAmbiguous = true
-	}
-	if g.routes[bestIdx] == nil {
-		eval.isFallback = true
-	}
-
-	return eval
-}
-
-// Filter evaluates the query and executes the appropriate handler with zero allocations.
-func (g *NeuroGate) Filter(ctx context.Context, text string, payload any) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	eval := g.evaluateFast(text)
-
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	// 1. Fallback Tier
-	if eval.isFallback {
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	// 2. Ambiguous Tier
-	if eval.isAmbiguous {
-		if g.ambiguous != nil {
-			pLabel := g.labels[eval.primaryIdx]
-			sLabel := ""
-			if eval.secondaryIdx >= 0 && eval.secondaryIdx < g.classCount {
-				sLabel = g.labels[eval.secondaryIdx]
-			}
-			return g.ambiguous(ctx, pLabel, sLabel, payload)
-		}
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	// 3. Definite Route Tier
-	if eval.primaryIdx < 0 || eval.primaryIdx >= g.classCount || g.routes[eval.primaryIdx] == nil {
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	return g.routes[eval.primaryIdx](ctx, payload)
-}
-
-// FilterPipeline evaluates the query supporting both definite, pipeline, and fallback executions.
-func (g *NeuroGate) FilterPipeline(ctx context.Context, text string, payload any) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	eval := g.evaluateFast(text)
-
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	// 1. Fallback Tier
-	if eval.isFallback {
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	pLabel := g.labels[eval.primaryIdx]
-	sLabel := ""
-	if eval.secondaryIdx >= 0 && eval.secondaryIdx < g.classCount {
-		sLabel = g.labels[eval.secondaryIdx]
-	}
-
-	// 2. Multi-Intent Pipeline Tier
-	if eval.isPipeline && sLabel != "" {
-		pipeKey := pipelineKey(pLabel, sLabel)
-		if pipeAction, exists := g.pipelines[pipeKey]; exists && pipeAction != nil {
-			return pipeAction(ctx, pLabel, sLabel, payload)
-		}
-	}
-
-	// 3. Ambiguous Tier
-	if eval.isAmbiguous {
-		if g.ambiguous != nil {
-			return g.ambiguous(ctx, pLabel, sLabel, payload)
-		}
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	// 4. Definite Route Tier
-	if eval.primaryIdx < 0 || eval.primaryIdx >= g.classCount || g.routes[eval.primaryIdx] == nil {
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	return g.routes[eval.primaryIdx](ctx, payload)
-}
-
-// evaluateFastTokens executes the 3-head gate directly on token IDs with strictly zero heap allocations.
-func (g *NeuroGate) evaluateFastTokens(tokens []uint32) gateEvaluation {
-	model := g.model.Load()
-	if model == nil || len(tokens) == 0 {
-		return gateEvaluation{isFallback: true}
-	}
-
-	if len(tokens) > MaxSequenceTokens {
-		tokens = tokens[:MaxSequenceTokens]
-	}
-
-	unkCount := 0
-	unkID, hasUnk := model.Tokenizer.VocabMap["[UNK]"]
-	for _, id := range tokens {
-		if hasUnk && id == unkID {
-			unkCount++
-		}
-	}
-	unkRatio := float64(unkCount) / float64(len(tokens))
-
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	embDim := int(model.Header.EmbeddingDim)
-	if embDim > MaxGateEmbDim {
-		embDim = MaxGateEmbDim
-	}
-	numClasses := g.classCount
-
-	var pooledStack [MaxGateEmbDim]float32
-	var rawLogitsStack [MaxGateClasses]float32
-	var normPooled [MaxGateEmbDim]float32
-
-	_ = model.PredictFeatures(tokens, pooledStack[:embDim], rawLogitsStack[:numClasses])
-
-	// [Head 1]: L2 Cosine OOD Guard
-	L2Normalize(pooledStack[:embDim], normPooled[:embDim])
-	if g.hasCentroid {
-		cosineSim := DotProduct(normPooled[:embDim], g.domainCentroid[:embDim])
-		if cosineSim < g.minCosineSim {
-			return gateEvaluation{isFallback: true}
-		}
-	}
-
-	// [Head 2]: 1-Cycle Bitwise Token Anchor Soft-Bias
-	var textBitmask uint64 = 0
-	for _, id := range tokens {
-		if m, exists := g.anchorTokenMap[id]; exists {
-			textBitmask |= m
-		}
-	}
-
-	var adjustedLogits [MaxGateClasses]float32
-	copy(adjustedLogits[:numClasses], rawLogitsStack[:numClasses])
-	var classDeltas [MaxGateClasses]float32
-	for _, rule := range g.anchorRules {
-		matchedBits := textBitmask & rule.Mask
-		if matchedBits != 0 {
-			count := float32(bits.OnesCount64(matchedBits))
-			classDeltas[rule.ClassIndex] += rule.Weight * count
-			for _, inhClass := range rule.InhibitClasses {
-				if inhClass >= 0 && inhClass < numClasses {
-					classDeltas[inhClass] -= rule.Penalty * count
-				}
-			}
-		}
-	}
-	for c := 0; c < numClasses; c++ {
-		delta := classDeltas[c]
-		if delta > 0 && g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
-			delta = g.maxAnchorBoost
-		}
-		adjustedLogits[c] += delta
-	}
-
-	// Logit margin computation
-	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
-	var coActive uint8 = 0
-	for i := 0; i < numClasses; i++ {
-		l := adjustedLogits[i]
-		if l >= DefaultActivationThreshold {
-			coActive++
-		}
-		if l > maxLogit1 {
-			maxLogit2 = maxLogit1
-			maxLogit1 = l
-		} else if l > maxLogit2 {
-			maxLogit2 = l
-		}
-	}
-	var logitMargin float32 = 0.0
-	if numClasses >= 2 {
-		logitMargin = maxLogit1 - maxLogit2
-	}
-
-	// [Head 3]: Stack Softmax, Margin, and Entropy
-	var probs [MaxGateClasses]float32
-	_ = Softmax(adjustedLogits[:numClasses], model.Temperature, probs[:numClasses])
-
-	var bestIdx, secondIdx int = 0, 1
-	var bestScore, secondScore float32 = -1.0, -1.0
-	for i := 0; i < numClasses; i++ {
-		p := probs[i]
-		if p > bestScore {
-			secondScore = bestScore
-			secondIdx = bestIdx
-			bestScore = p
-			bestIdx = i
-		} else if p > secondScore {
-			secondScore = p
-			secondIdx = i
-		}
-	}
-
-	calibratedConfidence := float64(bestScore) * (1.0 - unkRatio)
-	calibratedSecond := float64(secondScore) * (1.0 - unkRatio)
-	margin := calibratedConfidence - calibratedSecond
-	entropy := float64(computeEntropy(probs[:numClasses]))
-
-	// LogSumExp evaluation
-	var maxLogit float32 = adjustedLogits[0]
-	for i := 1; i < numClasses; i++ {
-		if adjustedLogits[i] > maxLogit {
-			maxLogit = adjustedLogits[i]
-		}
-	}
-	var sumExp float64
-	for i := 0; i < numClasses; i++ {
-		sumExp += math.Exp(float64(adjustedLogits[i] - maxLogit))
-	}
-	logSumExp := float64(maxLogit) + math.Log(sumExp)
-
-	if (g.policy.MinLogSumExp > 0 && logSumExp < g.policy.MinLogSumExp) ||
-		unkRatio >= 0.5 ||
-		calibratedConfidence < g.policy.LowThreshold ||
-		entropy > g.policy.MaxEntropy {
-		return gateEvaluation{isFallback: true, primaryIdx: bestIdx, secondaryIdx: secondIdx}
-	}
-
-	eval := gateEvaluation{
-		primaryIdx:   bestIdx,
-		secondaryIdx: secondIdx,
-	}
-
-	if secondIdx >= 0 {
-		pipeKey := pipelineKey(g.labels[bestIdx], g.labels[secondIdx])
-		_, hasPipeline := g.pipelines[pipeKey]
-		var primaryAnchors, secondaryAnchors bool
-		for _, rule := range g.anchorRules {
-			if (textBitmask & rule.Mask) != 0 {
-				if rule.ClassIndex == bestIdx {
-					primaryAnchors = true
-				}
-				if rule.ClassIndex == secondIdx {
-					secondaryAnchors = true
-				}
-			}
-		}
-		hasBothAnchors := primaryAnchors && secondaryAnchors
-		if calibratedSecond >= g.policy.PipelineThreshold || (hasBothAnchors && hasPipeline) {
-			eval.isPipeline = true
-		}
-	}
-	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) || (coActive >= 2 && g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin*1.5) {
-		eval.isAmbiguous = true
-	}
-	if g.routes[bestIdx] == nil {
-		eval.isFallback = true
-	}
-
-	return eval
-}
-
-// FilterTokens evaluates pre-tokenized inputs with strictly 0 B/op heap allocation.
-func (g *NeuroGate) FilterTokens(ctx context.Context, tokens []uint32, payload any) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	eval := g.evaluateFastTokens(tokens)
-
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	if eval.isFallback {
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	if eval.isAmbiguous {
-		if g.ambiguous != nil {
-			pLabel := g.labels[eval.primaryIdx]
-			sLabel := ""
-			if eval.secondaryIdx >= 0 && eval.secondaryIdx < g.classCount {
-				sLabel = g.labels[eval.secondaryIdx]
-			}
-			return g.ambiguous(ctx, pLabel, sLabel, payload)
-		}
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	if eval.primaryIdx < 0 || eval.primaryIdx >= g.classCount || g.routes[eval.primaryIdx] == nil {
-		if g.fallback != nil {
-			return g.fallback(ctx, payload)
-		}
-		return nil
-	}
-
-	return g.routes[eval.primaryIdx](ctx, payload)
-}
-

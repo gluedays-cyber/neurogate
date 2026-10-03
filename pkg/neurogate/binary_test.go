@@ -192,7 +192,7 @@ func TestFileIO(t *testing.T) {
 func TestFormatVersion2RoundTrip(t *testing.T) {
 	header := Header{
 		Magic:        MagicBytes,
-		Version:      CurrentFormatVersion, // Version 2
+		Version:      FormatVersion2, // Version 2
 		VocabSize:    4,
 		EmbeddingDim: 4,
 		HiddenDim:    6,
@@ -241,6 +241,61 @@ func TestFormatVersion2RoundTrip(t *testing.T) {
 		if loaded.Weights.Positional[i] != weights.Positional[i] {
 			t.Fatalf("Positional weight mismatch at index %d: expected %f, got %f", i, weights.Positional[i], loaded.Weights.Positional[i])
 		}
+	}
+}
+
+func TestFormatVersion3RoundTrip(t *testing.T) {
+	header := Header{
+		Magic:               MagicBytes,
+		Version:             FormatVersion3,
+		VocabSize:           4,
+		EmbeddingDim:        4,
+		HiddenDim:           6,
+		NumClasses:          2,
+		CalibratedMinEnergy: 6.842,
+		CalibratedMargin:    0.350,
+		CalibratedMinCosine: 0.280,
+	}
+
+	labels := []string{"Refund", "Delivery"}
+	vocab := []string{"[PAD]", "refund", "cancel", "delivery"}
+	mergeRules := []MergeRule{
+		{Token1: 1, Token2: 2, Target: 3},
+	}
+
+	posLen := int(MaxSequenceTokens * header.EmbeddingDim)
+	weights := Weights{
+		Embedding:  make([]float32, header.VocabSize*header.EmbeddingDim),
+		Positional: make([]float32, posLen),
+		W1:         make([]float32, header.EmbeddingDim*header.HiddenDim),
+		B1:         make([]float32, header.HiddenDim),
+		W2:         make([]float32, header.HiddenDim*header.NumClasses),
+		B2:         make([]float32, header.NumClasses),
+	}
+
+	v3Model := NewInferenceModel(header, labels, vocab, mergeRules, weights)
+
+	var buf bytes.Buffer
+	if err := SerializeModel(&buf, v3Model); err != nil {
+		t.Fatalf("SerializeModel v3 failed: %v", err)
+	}
+
+	loaded, err := DeserializeModel(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("DeserializeModel v3 failed: %v", err)
+	}
+
+	if loaded.Header.Version != FormatVersion3 {
+		t.Errorf("Expected version 3, got %d", loaded.Header.Version)
+	}
+	if loaded.Header.CalibratedMinEnergy != header.CalibratedMinEnergy {
+		t.Errorf("CalibratedMinEnergy mismatch: got %.3f, expected %.3f", loaded.Header.CalibratedMinEnergy, header.CalibratedMinEnergy)
+	}
+	if loaded.Header.CalibratedMargin != header.CalibratedMargin {
+		t.Errorf("CalibratedMargin mismatch: got %.3f, expected %.3f", loaded.Header.CalibratedMargin, header.CalibratedMargin)
+	}
+	if loaded.Header.CalibratedMinCosine != header.CalibratedMinCosine {
+		t.Errorf("CalibratedMinCosine mismatch: got %.3f, expected %.3f", loaded.Header.CalibratedMinCosine, header.CalibratedMinCosine)
 	}
 }
 
