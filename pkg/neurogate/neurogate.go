@@ -18,6 +18,9 @@ const (
 
 	// MaxGateEmbDim defines the maximum supported embedding dimension for zero-allocation stack buffers.
 	MaxGateEmbDim = 64
+
+	// DefaultMaxAnchorBoost defines the default maximum cumulative logit boost per class (prevents logit explosion).
+	DefaultMaxAnchorBoost float32 = 3.0
 )
 
 var (
@@ -126,10 +129,13 @@ type NeuroGate struct {
 	anchorDict     map[string]uint64
 	anchorTokenMap map[uint32]uint64
 	anchorRules    []AnchorRule
+	maxAnchorBoost float32
 
 	domainCentroid [MaxGateEmbDim]float32
 	hasCentroid    bool
 	minCosineSim   float32
+	domainMeanSim  float32
+	domainStdDev   float32
 
 	policy         DispatchPolicy
 	pipelines      map[string]PipelineAction
@@ -155,6 +161,7 @@ func NewNeuroGateWithModel(model *InferenceModel) *NeuroGate {
 		pipelines:      make(map[string]PipelineAction),
 		policy:         DefaultDispatchPolicy(),
 		minCosineSim:   0.25,
+		maxAnchorBoost: DefaultMaxAnchorBoost,
 	}
 	gate.model.Store(model)
 
@@ -255,6 +262,114 @@ func (g *NeuroGate) CalibrateDomainCentroid(samples []DataSample) *NeuroGate {
 		g.hasCentroid = true
 	}
 	return g
+}
+
+// CalibrateDomainDistribution calculates the manifold center and dynamically computes
+// the standard deviation of cosine similarities across sample embeddings to configure an adaptive OOD threshold:
+// minCosine = mean - (k * stdDev).
+func (g *NeuroGate) CalibrateDomainDistribution(samples []DataSample, k float32) *NeuroGate {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	model := g.model.Load()
+	if model == nil || len(samples) == 0 {
+		return g
+	}
+
+	embDim := int(model.Header.EmbeddingDim)
+	if embDim > MaxGateEmbDim {
+		embDim = MaxGateEmbDim
+	}
+
+	var sum [MaxGateEmbDim]float64
+	validCount := 0
+	var pooled [MaxGateEmbDim]float32
+	var dummyLogits [MaxGateClasses]float32
+
+	for _, s := range samples {
+		tokens := model.Tokenizer.Encode(s.Text)
+		if len(tokens) == 0 {
+			continue
+		}
+		if err := model.PredictFeatures(tokens, pooled[:embDim], dummyLogits[:g.classCount]); err == nil {
+			for d := 0; d < embDim; d++ {
+				sum[d] += float64(pooled[d])
+			}
+			validCount++
+		}
+	}
+
+	if validCount == 0 {
+		return g
+	}
+
+	inv := 1.0 / float64(validCount)
+	var raw [MaxGateEmbDim]float32
+	for d := 0; d < embDim; d++ {
+		raw[d] = float32(sum[d] * inv)
+	}
+	L2Normalize(raw[:embDim], g.domainCentroid[:embDim])
+	g.hasCentroid = true
+
+	// Pass 2: Calculate distribution variance and std dev of cosine similarities
+	var sumSim, sumSqSim float64
+	evalCount := 0
+	var normPooled [MaxGateEmbDim]float32
+	for _, s := range samples {
+		tokens := model.Tokenizer.Encode(s.Text)
+		if len(tokens) == 0 {
+			continue
+		}
+		if err := model.PredictFeatures(tokens, pooled[:embDim], dummyLogits[:g.classCount]); err == nil {
+			L2Normalize(pooled[:embDim], normPooled[:embDim])
+			sim := DotProduct(normPooled[:embDim], g.domainCentroid[:embDim])
+			sumSim += float64(sim)
+			sumSqSim += float64(sim * sim)
+			evalCount++
+		}
+	}
+
+	if evalCount > 0 {
+		n := float64(evalCount)
+		mean := float32(sumSim / n)
+		variance := float32((sumSqSim / n) - float64(mean*mean))
+		if variance < 0 {
+			variance = 0
+		}
+		stdDev := float32(math.Sqrt(float64(variance)))
+		g.domainMeanSim = mean
+		g.domainStdDev = stdDev
+
+		adaptiveMin := mean - (k * stdDev)
+		if adaptiveMin < -1.0 {
+			adaptiveMin = -1.0
+		}
+		g.minCosineSim = adaptiveMin
+	}
+
+	return g
+}
+
+// DomainStats returns the calibrated manifold distribution metrics.
+func (g *NeuroGate) DomainStats() (hasCentroid bool, meanSim float32, stdDev float32, minCosine float32) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.hasCentroid, g.domainMeanSim, g.domainStdDev, g.minCosineSim
+}
+
+// SetMaxAnchorBoost sets the maximum cumulative soft-bias logit boost allowed per class (prevents logit explosion).
+func (g *NeuroGate) SetMaxAnchorBoost(cap float32) *NeuroGate {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.maxAnchorBoost = cap
+	return g
+}
+
+// MaxAnchorBoost returns the current cap for cumulative anchor logit boost.
+func (g *NeuroGate) MaxAnchorBoost() float32 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.maxAnchorBoost
 }
 
 // SetDomainBoundary configures the reference L2 centroid and minimum cosine similarity for OOD rejection.
@@ -434,12 +549,20 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 
 	var adjustedLogits [MaxGateClasses]float32
 	copy(adjustedLogits[:numClasses], rawLogitsStack[:numClasses])
+	var classDeltas [MaxGateClasses]float32
 	for _, rule := range g.anchorRules {
 		matchedBits := textBitmask & rule.Mask
 		if matchedBits != 0 {
 			count := float32(bits.OnesCount64(matchedBits))
-			adjustedLogits[rule.ClassIndex] += rule.Weight * count
+			classDeltas[rule.ClassIndex] += rule.Weight * count
 		}
+	}
+	for c := 0; c < numClasses; c++ {
+		delta := classDeltas[c]
+		if g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
+			delta = g.maxAnchorBoost
+		}
+		adjustedLogits[c] += delta
 	}
 
 	// -------------------------------------------------------------
@@ -645,12 +768,20 @@ func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
 
 	var adjustedLogits [MaxGateClasses]float32
 	copy(adjustedLogits[:numClasses], rawLogitsStack[:numClasses])
+	var classDeltas [MaxGateClasses]float32
 	for _, rule := range g.anchorRules {
 		matchedBits := textBitmask & rule.Mask
 		if matchedBits != 0 {
 			count := float32(bits.OnesCount64(matchedBits))
-			adjustedLogits[rule.ClassIndex] += rule.Weight * count
+			classDeltas[rule.ClassIndex] += rule.Weight * count
 		}
+	}
+	for c := 0; c < numClasses; c++ {
+		delta := classDeltas[c]
+		if g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
+			delta = g.maxAnchorBoost
+		}
+		adjustedLogits[c] += delta
 	}
 
 	// [Head 3]: Softmax, Margin, and Entropy
@@ -890,12 +1021,20 @@ func (g *NeuroGate) evaluateFastTokens(tokens []uint32) gateEvaluation {
 
 	var adjustedLogits [MaxGateClasses]float32
 	copy(adjustedLogits[:numClasses], rawLogitsStack[:numClasses])
+	var classDeltas [MaxGateClasses]float32
 	for _, rule := range g.anchorRules {
 		matchedBits := textBitmask & rule.Mask
 		if matchedBits != 0 {
 			count := float32(bits.OnesCount64(matchedBits))
-			adjustedLogits[rule.ClassIndex] += rule.Weight * count
+			classDeltas[rule.ClassIndex] += rule.Weight * count
 		}
+	}
+	for c := 0; c < numClasses; c++ {
+		delta := classDeltas[c]
+		if g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
+			delta = g.maxAnchorBoost
+		}
+		adjustedLogits[c] += delta
 	}
 
 	// [Head 3]: Stack Softmax, Margin, and Entropy

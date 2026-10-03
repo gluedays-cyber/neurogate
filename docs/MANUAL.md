@@ -1,4 +1,4 @@
-﻿# NeuroGate: Embedded Neural AI Manual & Tutorial for Go Developers
+# NeuroGate: Embedded Neural AI Manual & Tutorial for Go Developers
 
 <p align="center">
   <img src="assets/neurogate-hero.jpg" width="100%" alt="NeuroGate vs Retro Branching — Electric Hyperbike vs Rusty Bicycle">
@@ -150,6 +150,7 @@ Defines 3-tier confidence boundaries, margin cutoffs, Shannon entropy limits, an
 // FailSafe Sentinel Errors (Layer 1 & Layer 2)
 var (
 	ErrUnlearnedVocabulary = errors.New("neurogate: input dominated by unlearned subwords or OOV fragments")
+	ErrDegeneratedInput    = errors.New("neurogate: degenerated repetitive token sequence detected")
 	ErrLowConfidence       = errors.New("neurogate: prediction confidence below safety threshold")
 	ErrHighEntropy         = errors.New("neurogate: prediction entropy exceeds uncertainty boundary")
 	ErrOutOfDomain         = errors.New("neurogate: request energy or representation is out of domain")
@@ -165,6 +166,7 @@ type DispatchPolicy struct {
     MinLogSumExp         float64 `json:"min_log_sum_exp,omitempty"` // Min log-sum-exp energy boundary before OOD isolation (0 disables)
     MaxSingleCharRatio   float64 `json:"max_single_char_ratio"`     // Layer 1: Max ratio of single-char fallback tokens (default: 0.70)
     MaxUnknownTokenRatio float64 `json:"max_unknown_token_ratio"`   // Layer 1: Max ratio of UNK tokens (default: 0.30)
+    MinUniqueTokenRatio  float64 `json:"min_unique_token_ratio"`    // Layer 1: Min ratio of unique tokens to block repetitive flood abuse (default: 0.25)
 }
 
 func (r *Router) SetPolicy(policy DispatchPolicy) *Router
@@ -256,6 +258,7 @@ type RouteDecision struct {
 	Margin              float64 `json:"margin"`
 	SingleCharRatio     float64 `json:"single_char_ratio"`
 	UnknownTokenRatio   float64 `json:"unknown_token_ratio"`
+	UniqueTokenRatio    float64 `json:"unique_token_ratio"`
 	SecondaryIntent     string  `json:"secondary_intent,omitempty"`
 	SecondaryConfidence float64 `json:"secondary_confidence,omitempty"`
 }
@@ -267,6 +270,7 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 
 | Phase | Metric Checked | Cutoff Condition | Returned Sentinel Error | Execution Cost |
 | :--- | :--- | :--- | :--- | :--- |
+| **Layer 1** (Tokenizer) | Repetitive token flood ratio | `UniqueTokenRatio < MinUniqueTokenRatio` (0.25) | `ErrDegeneratedInput` | **< 1 μs** (No forward pass) |
 | **Layer 1** (Tokenizer) | Single-character fragment ratio | `SingleCharRatio >= MaxSingleCharRatio` (0.70) | `ErrUnlearnedVocabulary` | **< 1 μs** (No forward pass) |
 | **Layer 1** (Tokenizer) | UNK token ratio | `UnknownTokenRatio >= MaxUnknownTokenRatio` (0.30) | `ErrUnlearnedVocabulary` | **< 1 μs** (No forward pass) |
 | **Layer 2** (Neural Output) | Free energy ($-\text{LogSumExp}$) | `Energy < MinLogSumExp` (if configured) | `ErrOutOfDomain` | **~29 μs** (MLP forward) |
@@ -293,6 +297,12 @@ func ProcessUserQuery(ctx context.Context, router *neurogate.Router, query strin
 	decision, err := router.RouteQuery(ctx, query)
 	if err != nil {
 		switch {
+		case errors.Is(err, neurogate.ErrDegeneratedInput):
+			// [Layer 1 Guard (< 1 μs)]: Repetitive token flood attack
+			fmt.Printf("[L1 FLOOD REJECT] Degenerated input (Unique token ratio: %.1f%%). Isolated.\n",
+				decision.UniqueTokenRatio*100)
+			return
+
 		case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
 			// [Layer 1 Guard (< 1 μs)]: Foreign glyphs, unlearned slang, or noise
 			// Rejects immediately without forward pass, saving cloud LLM API cost
@@ -409,7 +419,10 @@ func NewNeuroGateWithModel(model *InferenceModel) *NeuroGate
 | :--- | :--- | :--- |
 | **`Bind`** | `.Bind(label string, handler RouteAction) *GateRouteBuilder` | Registers an action handler and returns a builder for symbolic anchor chaining. |
 | **`WithAnchor`** | `.WithAnchor(weight float32, keywords ...string) *GateRouteBuilder` | Maps keywords to 64-bit bitmasks, injecting an additive logit bias scaled by matched bits in 1 CPU cycle. |
+| **`SetMaxAnchorBoost`**| `.SetMaxAnchorBoost(cap float32) *NeuroGate` | Enforces a strict upper bound (clamping limit) on cumulative anchor bias per class to prevent logit explosion. |
 | **`CalibrateDomainCentroid`** | `.CalibrateDomainCentroid(samples []DataSample) *NeuroGate` | Computes the true L2 manifold centroid of domain sentences for geometric OOD gating. |
+| **`CalibrateDomainDistribution`** | `.CalibrateDomainDistribution(samples []DataSample, k float32) *NeuroGate` | Computes manifold centroid and dynamic $\text{MinCosine} = \mu - k\cdot\sigma$ based on embedding variance. |
+| **`DomainStats`** | `.DomainStats() (hasCentroid bool, meanSim, stdDev, minCosine float32)` | Returns current calibrated manifold statistics. |
 | **`SetDomainBoundary`** | `.SetDomainBoundary(centroid []float32, minCosine float32) *NeuroGate` | Manually configures the reference L2 centroid and minimum cosine similarity threshold. |
 | **`Filter`** | `.Filter(ctx context.Context, text string, payload any) error` | Fast-path routing evaluating all 3 heads with minimal allocations (~5 μs). |
 | **`FilterTokens`** | `.FilterTokens(ctx context.Context, tokens []uint32, payload any) error` | Zero-allocation hot-path execution with strictly **0 B/op and 0 allocs/op (~28 μs)**. |
@@ -426,7 +439,7 @@ import (
 	"fmt"
 	"log"
 
-	"neurogate/pkg/neurogate"
+	"github.com/gluedays-cyber/neurogate"
 )
 
 func main() {
@@ -435,11 +448,14 @@ func main() {
 		log.Fatalf("Failed to init NeuroGate: %v", err)
 	}
 
-	// 1. Calibrate manifold centroid from training samples
+	// 1. Calibrate adaptive manifold boundary using 2-sigma variance threshold
 	samples, _ := neurogate.LoadCSVDataset("data/demo_iot.csv")
-	gate.CalibrateDomainCentroid(samples).SetMinCosineSim(0.35)
+	gate.CalibrateDomainDistribution(samples, 2.0)
 
-	// 2. Bind route actions with symbolic anchor soft-biases
+	// 2. Configure maximum anchor logit boost cap (prevents logit explosion)
+	gate.SetMaxAnchorBoost(3.0)
+
+	// 3. Bind route actions with symbolic anchor soft-biases
 	gate.Bind("LightControl", func(ctx context.Context, payload any) error {
 		fmt.Println("[ACTION: LightControl] Switched living room chandelier")
 		return nil
@@ -455,7 +471,7 @@ func main() {
 		return nil
 	})
 
-	// 3. Dispatch queries with zero-alloc hot path
+	// 4. Dispatch queries with zero-alloc hot path
 	ctx := context.Background()
 	_ = gate.Filter(ctx, "it is too dark in here please switch on lamps", nil)
 }
@@ -1015,6 +1031,7 @@ NeuroGate models are compiled into a custom, compact Little-Endian binary (`.bin
 - **Format Compatibility**: Fully backward-compatible. Version `0x0001` reads blocks 1–5; Version `0x0002` embeds 32 positional vectors (block 6) for word-order XOR disambiguation.
 - **Endianness**: Explicitly Little-Endian (`encoding/binary.LittleEndian`). Safe for cross-compiling on ARM64 and AMD64 architectures.
 - **Integrity Verification**: `crypto/sha256` recalculates the checksum during `LoadBinaryModel()`. Any bit rot, truncation, or malicious tampering results in an immediate `ErrChecksumFailed` halt.
+- **Numerical Finite Verification**: Beyond SHA-256 integrity, `DeserializeModel()` performs linear validation over all IEEE 754 float32 slices to guarantee the absence of `NaN` or `±Inf` values. Corrupted models from divergent training runs are immediately rejected with `ErrCorruptedTensor`, preventing poisoned runtime calculations.
 
 ---
 

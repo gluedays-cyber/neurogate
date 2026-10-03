@@ -521,5 +521,58 @@ func TestFailSafeLayer2_NeuralMetrics(t *testing.T) {
 	}
 }
 
+func TestRouterRepetitiveTokenFlood(t *testing.T) {
+	tempDir := t.TempDir()
+	modelPath := filepath.Join(tempDir, "flood_router.bin")
+
+	sampleModel := createSampleModel()
+	if err := SaveBinaryModel(modelPath, sampleModel); err != nil {
+		t.Fatalf("Failed to save model: %v", err)
+	}
+
+	router, err := NewRouter(modelPath, 0.50)
+	if err != nil {
+		t.Fatalf("Failed to init router: %v", err)
+	}
+
+	// 1. Repetitive normal words flood -> Layer 1 rejection with ErrDegeneratedInput
+	ctx := context.Background()
+	floodQuery := "refund refund refund refund refund refund"
+	decision, err := router.RouteQuery(ctx, floodQuery)
+	if err == nil {
+		t.Fatalf("expected ErrDegeneratedInput for repetitive token sequence, got nil")
+	}
+	if err != ErrDegeneratedInput {
+		t.Fatalf("expected ErrDegeneratedInput, got %v", err)
+	}
+	if decision.UniqueTokenRatio >= router.policy.MinUniqueTokenRatio {
+		t.Fatalf("expected UniqueTokenRatio < %f, got %f", router.policy.MinUniqueTokenRatio, decision.UniqueTokenRatio)
+	}
+
+	// 2. Verify Dispatch routes to Fallback on repetitive token flood
+	var fallbackInvoked bool
+	router.Fallback(func(ctx context.Context, payload any) error {
+		fallbackInvoked = true
+		return nil
+	})
+
+	err = router.Dispatch(ctx, floodQuery, nil)
+	if err != nil {
+		t.Fatalf("Dispatch should invoke fallback without error, got: %v", err)
+	}
+	if !fallbackInvoked {
+		t.Fatalf("Expected fallback to be invoked on repetitive input flood")
+	}
+
+	// 3. Verify Inspect records repetitive pattern fallback reason
+	trace := router.Inspect(floodQuery)
+	if !trace.IsFallback {
+		t.Fatalf("Expected Inspect trace.IsFallback to be true for repetitive input")
+	}
+	if trace.FallbackReason == "" {
+		t.Fatalf("Expected non-empty FallbackReason in Inspect trace")
+	}
+}
+
 
 

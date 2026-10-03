@@ -26,6 +26,8 @@ var (
 	ErrModelNotInitialized = core.ErrModelNotInitialized
 	ErrClassIndexOutOfRange = core.ErrClassIndexOutOfRange
 	ErrUnlearnedVocabulary = core.ErrUnlearnedVocabulary
+	ErrDegeneratedInput    = core.ErrDegeneratedInput
+	ErrCorruptedTensor     = core.ErrCorruptedTensor
 	ErrLowConfidence       = core.ErrLowConfidence
 	ErrHighEntropy         = core.ErrHighEntropy
 	ErrOutOfDomain         = core.ErrOutOfDomain
@@ -55,7 +57,8 @@ var (
 	DefaultDispatchPolicy = core.DefaultDispatchPolicy
 
 	// Math & Ops
-	LogSumExp        = core.LogSumExp
-	CosineSimilarity = core.CosineSimilarity
+	LogSumExp                 = core.LogSumExp
+	CosineSimilarity          = core.CosineSimilarity
+	CalculateUniqueTokenRatio = core.CalculateUniqueTokenRatio
 )
 

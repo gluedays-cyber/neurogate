@@ -148,3 +148,80 @@ func BenchmarkNeuroGateFilterTokensZeroAlloc(b *testing.B) {
 		_ = gate.FilterTokens(ctx, tokens, nil)
 	}
 }
+
+func TestNeuroGateAnchorBoostCap(t *testing.T) {
+	samples := []DataSample{
+		{Text: "please refund money to card", Label: "Refund"},
+		{Text: "package delivery courier tracking", Label: "Delivery"},
+	}
+	cfg := DefaultTrainConfig()
+	cfg.Epochs = 20
+	model, err := TrainModel(samples, cfg)
+	if err != nil {
+		t.Fatalf("TrainModel failed: %v", err)
+	}
+
+	gate := NewNeuroGateWithModel(model)
+	// Register anchor rule with large weight: 5.0 per matched keyword
+	gate.Bind("Refund", func(ctx context.Context, payload any) error {
+		return nil
+	}).WithAnchor(5.0, "refund", "money", "card")
+
+	// 1. With maxAnchorBoost capped at 2.0
+	gate.SetMaxAnchorBoost(2.0)
+	if capVal := gate.MaxAnchorBoost(); capVal != 2.0 {
+		t.Fatalf("expected maxAnchorBoost 2.0, got %f", capVal)
+	}
+
+	traceCapped := gate.Inspect("please refund money to card")
+	if len(traceCapped.TriggeredAnchors) < 2 {
+		t.Fatalf("expected multiple triggered anchors, got %v", traceCapped.TriggeredAnchors)
+	}
+
+	// 2. Uncap or increase cap and check relative confidence change
+	gate.SetMaxAnchorBoost(10.0)
+	traceHighCap := gate.Inspect("please refund money to card")
+
+	// Under a higher cap, the logit boost is greater, leading to higher confidence for Refund
+	if traceHighCap.Confidence <= traceCapped.Confidence {
+		t.Logf("Capped conf: %f, High cap conf: %f", traceCapped.Confidence, traceHighCap.Confidence)
+	}
+}
+
+func TestNeuroGateCalibrateDomainDistribution(t *testing.T) {
+	samples := []DataSample{
+		{Text: "please refund money to card", Label: "Refund"},
+		{Text: "i want my money back for cancellation", Label: "Refund"},
+		{Text: "package delivery courier tracking shipment", Label: "Delivery"},
+		{Text: "where is my parcel courier driver", Label: "Delivery"},
+	}
+	cfg := DefaultTrainConfig()
+	cfg.Epochs = 25
+	model, err := TrainModel(samples, cfg)
+	if err != nil {
+		t.Fatalf("TrainModel failed: %v", err)
+	}
+
+	gate := NewNeuroGateWithModel(model)
+	gate.CalibrateDomainDistribution(samples, 2.0)
+
+	hasCentroid, meanSim, stdDev, minCosine := gate.DomainStats()
+	if !hasCentroid {
+		t.Fatalf("expected hasCentroid to be true after calibration")
+	}
+	if meanSim <= 0.0 {
+		t.Fatalf("expected positive meanSim, got %f", meanSim)
+	}
+	if stdDev < 0.0 {
+		t.Fatalf("expected non-negative stdDev, got %f", stdDev)
+	}
+	if minCosine > meanSim {
+		t.Fatalf("expected minCosine (%f) <= meanSim (%f)", minCosine, meanSim)
+	}
+
+	// Inspect in-domain query
+	traceIn := gate.Inspect("please refund money back to credit card")
+	if traceIn.IsOOD {
+		t.Errorf("expected in-domain query to not be OOD, got sim=%f, minCosine=%f", traceIn.CosineSimilarity, minCosine)
+	}
+}

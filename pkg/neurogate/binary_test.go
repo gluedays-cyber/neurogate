@@ -2,6 +2,8 @@ package neurogate
 
 import (
 	"bytes"
+	"errors"
+	"math"
 	"path/filepath"
 	"testing"
 )
@@ -241,3 +243,40 @@ func TestFormatVersion2RoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestDeserializeCorruptedTensor_NaN_Inf(t *testing.T) {
+	// 1. Test NaN rejection
+	mNaN := createSampleModel()
+	mNaN.Weights.W1[0] = float32(math.NaN())
+
+	var bufNaN bytes.Buffer
+	if err := SerializeModel(&bufNaN, mNaN); err != nil {
+		t.Fatalf("SerializeModel failed: %v", err)
+	}
+
+	_, errNaN := DeserializeModel(bytes.NewReader(bufNaN.Bytes()))
+	if errNaN == nil {
+		t.Fatalf("expected error deserializing tensor containing NaN, got nil")
+	}
+	if !errors.Is(errNaN, ErrCorruptedTensor) {
+		t.Fatalf("expected ErrCorruptedTensor, got: %v", errNaN)
+	}
+
+	// 2. Test Inf rejection
+	mInf := createSampleModel()
+	mInf.Weights.W2[1] = float32(math.Inf(1))
+
+	var bufInf bytes.Buffer
+	if err := SerializeModel(&bufInf, mInf); err != nil {
+		t.Fatalf("SerializeModel failed: %v", err)
+	}
+
+	_, errInf := DeserializeModel(bytes.NewReader(bufInf.Bytes()))
+	if errInf == nil {
+		t.Fatalf("expected error deserializing tensor containing Inf, got nil")
+	}
+	if !errors.Is(errInf, ErrCorruptedTensor) {
+		t.Fatalf("expected ErrCorruptedTensor, got: %v", errInf)
+	}
+}
+

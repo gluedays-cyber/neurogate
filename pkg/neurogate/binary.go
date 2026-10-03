@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 )
 
@@ -19,6 +20,7 @@ var (
 	ErrInvalidMagic     = errors.New("invalid binary format: missing IBRN magic header")
 	ErrUnsupportedVer   = errors.New("unsupported model format version")
 	ErrChecksumFailed   = errors.New("checksum verification failed: model file corrupted")
+	ErrCorruptedTensor  = errors.New("model corruption: tensor contains NaN/Inf values")
 	ErrInvalidTensorDim = errors.New("tensor dimension does not match header configuration")
 	ErrEmptyInput       = errors.New("input token slice cannot be empty")
 )
@@ -312,6 +314,28 @@ func DeserializeModel(r io.Reader) (*InferenceModel, error) {
 		return nil, fmt.Errorf("failed to read B2: %w", err)
 	}
 
+	// 5.1 Verify Numerical Integrity (Strict NaN / Inf Prevention)
+	if err := assertFiniteWeights(weights.Embedding, "Embedding"); err != nil {
+		return nil, err
+	}
+	if header.Version >= 2 {
+		if err := assertFiniteWeights(weights.Positional, "Positional"); err != nil {
+			return nil, err
+		}
+	}
+	if err := assertFiniteWeights(weights.W1, "W1"); err != nil {
+		return nil, err
+	}
+	if err := assertFiniteWeights(weights.B1, "B1"); err != nil {
+		return nil, err
+	}
+	if err := assertFiniteWeights(weights.W2, "W2"); err != nil {
+		return nil, err
+	}
+	if err := assertFiniteWeights(weights.B2, "B2"); err != nil {
+		return nil, err
+	}
+
 	// 6. Verify Checksum Block
 	var storedChecksum [32]byte
 	if _, err := io.ReadFull(r, storedChecksum[:]); err != nil {
@@ -326,4 +350,14 @@ func DeserializeModel(r io.Reader) (*InferenceModel, error) {
 	}
 
 	return NewInferenceModel(header, labels, vocab, mergeRules, weights), nil
+}
+
+// assertFiniteWeights scans float slices for NaN or Inf to prevent mathematical contamination.
+func assertFiniteWeights(weights []float32, name string) error {
+	for i, w := range weights {
+		if math.IsNaN(float64(w)) || math.IsInf(float64(w), 0) {
+			return fmt.Errorf("%w: tensor '%s' at index %d has non-finite value (%v)", ErrCorruptedTensor, name, i, w)
+		}
+	}
+	return nil
 }

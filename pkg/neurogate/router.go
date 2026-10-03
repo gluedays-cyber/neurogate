@@ -29,6 +29,7 @@ type DispatchPolicy struct {
 	MinLogSumExp         float64 `json:"min_log_sum_exp,omitempty"` // Minimum log-sum-exp energy boundary before OOD isolation (0 disables)
 	MaxSingleCharRatio   float64 `json:"max_single_char_ratio"`     // Layer 1: Max ratio of single-char fallback tokens (default: 0.70)
 	MaxUnknownTokenRatio float64 `json:"max_unknown_token_ratio"`   // Layer 1: Max ratio of UNK tokens (default: 0.30)
+	MinUniqueTokenRatio  float64 `json:"min_unique_token_ratio"`    // Layer 1: Min ratio of unique tokens to block flood/repetition (default: 0.25)
 }
 
 // DefaultDispatchPolicy creates standard production-ready 3-tier routing criteria.
@@ -42,6 +43,7 @@ func DefaultDispatchPolicy() DispatchPolicy {
 		MinLogSumExp:         0.0,
 		MaxSingleCharRatio:   0.70,
 		MaxUnknownTokenRatio: 0.30,
+		MinUniqueTokenRatio:  0.25,
 	}
 }
 
@@ -54,6 +56,7 @@ type RouteDecision struct {
 	Margin              float64            `json:"margin"`
 	SingleCharRatio     float64            `json:"single_char_ratio"`
 	UnknownTokenRatio   float64            `json:"unknown_token_ratio"`
+	UniqueTokenRatio    float64            `json:"unique_token_ratio"`
 	SecondaryIntent     string             `json:"secondary_intent,omitempty"`
 	SecondaryConfidence float64            `json:"secondary_confidence,omitempty"`
 }
@@ -65,6 +68,7 @@ type RouteTrace struct {
 	Subwords           []string           `json:"subwords"`
 	SingleCharRatio    float64            `json:"single_char_ratio"`
 	UnknownTokenRatio  float64            `json:"unknown_token_ratio"`
+	UniqueTokenRatio   float64            `json:"unique_token_ratio"`
 	ClassProbabilities map[string]float32 `json:"class_probabilities"`
 	PredictedLabel     string             `json:"predicted_label"`
 	SecondaryLabel     string             `json:"secondary_label,omitempty"`
@@ -80,6 +84,27 @@ type RouteTrace struct {
 	LatencyMicros      int64              `json:"latency_micros"`
 }
 
+// CalculateUniqueTokenRatio computes the ratio of unique tokens in a sequence with zero heap allocation.
+func CalculateUniqueTokenRatio(tokens []uint32) float64 {
+	n := len(tokens)
+	if n == 0 {
+		return 0.0
+	}
+	uniqueCount := 0
+	for i := 0; i < n; i++ {
+		seen := false
+		for j := 0; j < i; j++ {
+			if tokens[i] == tokens[j] {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			uniqueCount++
+		}
+	}
+	return float64(uniqueCount) / float64(n)
+}
 
 func pipelineKey(primary, secondary string) string {
 	return primary + "->" + secondary
@@ -273,16 +298,27 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 	// [Layer 1 Guard] Tokenizer-level unlearned vocabulary cutoff (< 1 μs)
 	// -------------------------------------------------------------
 	singleRatio, unkRatio := model.Tokenizer.AnalyzeUnlearnedRatio(tokenIDs)
+	uniqueRatio := CalculateUniqueTokenRatio(tokenIDs)
+
+	if len(tokenIDs) >= 4 && r.policy.MinUniqueTokenRatio > 0.0 && uniqueRatio < r.policy.MinUniqueTokenRatio {
+		return RouteDecision{
+			SingleCharRatio:   singleRatio,
+			UnknownTokenRatio: unkRatio,
+			UniqueTokenRatio:  uniqueRatio,
+		}, ErrDegeneratedInput
+	}
 	if len(tokenIDs) >= 2 && r.policy.MaxSingleCharRatio > 0.0 && singleRatio >= r.policy.MaxSingleCharRatio {
 		return RouteDecision{
 			SingleCharRatio:   singleRatio,
 			UnknownTokenRatio: unkRatio,
+			UniqueTokenRatio:  uniqueRatio,
 		}, ErrUnlearnedVocabulary
 	}
 	if r.policy.MaxUnknownTokenRatio > 0.0 && unkRatio >= r.policy.MaxUnknownTokenRatio {
 		return RouteDecision{
 			SingleCharRatio:   singleRatio,
 			UnknownTokenRatio: unkRatio,
+			UniqueTokenRatio:  uniqueRatio,
 		}, ErrUnlearnedVocabulary
 	}
 
@@ -326,6 +362,7 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 		Margin:              margin,
 		SingleCharRatio:     singleRatio,
 		UnknownTokenRatio:   unkRatio,
+		UniqueTokenRatio:    uniqueRatio,
 		SecondaryIntent:     secondaryLabel,
 		SecondaryConfidence: secondaryConf,
 	}
@@ -386,7 +423,11 @@ func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 	tokenIDs := model.Tokenizer.Encode(text)
 	singleRatio, _ := model.Tokenizer.AnalyzeUnlearnedRatio(tokenIDs)
 
-	// Layer 1 Fallback Guard: check unlearned vocabulary single-character fragmenting
+	// Layer 1 Fallback Guard: check repetitive token flooding or unlearned vocabulary
+	if len(tokenIDs) >= 4 && r.policy.MinUniqueTokenRatio > 0.0 && CalculateUniqueTokenRatio(tokenIDs) < r.policy.MinUniqueTokenRatio {
+		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
+		return r.fallback(ctx, payload)
+	}
 	if len(tokenIDs) >= 2 && r.policy.MaxSingleCharRatio > 0.0 && singleRatio >= r.policy.MaxSingleCharRatio {
 		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
 		return r.fallback(ctx, payload)
@@ -496,6 +537,7 @@ func (r *Router) Inspect(text string) RouteTrace {
 	}
 
 	singleRatio, unkRatio := model.Tokenizer.AnalyzeUnlearnedRatio(tokens)
+	uniqueRatio := CalculateUniqueTokenRatio(tokens)
 
 	probs, err := model.Forward(tokens, model.Temperature)
 	probMap := make(map[string]float32, len(model.Labels))
@@ -535,6 +577,7 @@ func (r *Router) Inspect(text string) RouteTrace {
 		Subwords:           subwords,
 		SingleCharRatio:    singleRatio,
 		UnknownTokenRatio:  unkRatio,
+		UniqueTokenRatio:   uniqueRatio,
 		ClassProbabilities: probMap,
 		PredictedLabel:     bestLabel,
 		SecondaryLabel:     secondLabel,
@@ -549,6 +592,9 @@ func (r *Router) Inspect(text string) RouteTrace {
 	if err != nil {
 		trace.IsFallback = true
 		trace.FallbackReason = fmt.Sprintf("inference error: %v", err)
+	} else if len(tokens) >= 4 && r.policy.MinUniqueTokenRatio > 0.0 && uniqueRatio < r.policy.MinUniqueTokenRatio {
+		trace.IsFallback = true
+		trace.FallbackReason = fmt.Sprintf("repetitive pattern detected (unique token ratio %.2f < %.2f)", uniqueRatio, r.policy.MinUniqueTokenRatio)
 	} else if len(tokens) >= 2 && r.policy.MaxSingleCharRatio > 0.0 && singleRatio >= r.policy.MaxSingleCharRatio {
 		trace.IsFallback = true
 		trace.FallbackReason = fmt.Sprintf("unlearned vocabulary (single-char ratio %.2f >= %.2f)", singleRatio, r.policy.MaxSingleCharRatio)

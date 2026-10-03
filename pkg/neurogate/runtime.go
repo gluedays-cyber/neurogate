@@ -22,6 +22,7 @@ var (
 
 	// Fail-Safe Sentinel Errors (Layer 1 & Layer 2)
 	ErrUnlearnedVocabulary = errors.New("neurogate: input dominated by unlearned subwords or OOV fragments")
+	ErrDegeneratedInput    = errors.New("neurogate: degenerated repetitive token sequence detected")
 	ErrLowConfidence       = errors.New("neurogate: prediction confidence below safety threshold")
 	ErrHighEntropy         = errors.New("neurogate: prediction entropy exceeds uncertainty boundary")
 	ErrOutOfDomain         = errors.New("neurogate: request energy or representation is out of domain")

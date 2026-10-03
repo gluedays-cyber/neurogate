@@ -1,4 +1,4 @@
-﻿# NeuroGate
+# NeuroGate
 
 <p align="center">
   <img src="assets/neurogate-hero.jpg" width="100%" alt="NeuroGate vs Retro Branching — Electric Hyperbike vs Rusty Bicycle">
@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Release-v2.5.0_Hardened-purple.svg" alt="Release v2.5.0">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Latency-~30_μs-brightgreen.svg" alt="Latency"></a>
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Allocs-0_B/op_(0_allocs)-blue.svg" alt="Allocations"></a>
   <img src="https://img.shields.io/badge/Wire_Format-v2_Positional-orange.svg" alt="Format v2">
@@ -36,8 +37,9 @@ Incoming Request ("bruh can u refund order #49281")
        [ In-Memory BPE Tokenizer ]
                      │
        ┌─────────────┴────────────────────────────────┐
-       │ [Layer 1 Guard]: Unlearned Single-Char Ratio │ ──> SingleCharRatio ≥ 0.70?
-       │ (< 1 μs, Zero Forward Math Computation)      │     --> Immediate ErrUnlearnedVocabulary
+       │ [Layer 1 Guard]: Fast Pre-Neural Fail-Safe   │ ──> SingleCharRatio ≥ 0.70 (Unlearned OOV)
+       │ (< 1 μs, Zero Forward Math Computation)      │     OR UniqueTokenRatio < 0.25 (Flood Abuse)
+       │                                              │     --> Immediate ErrUnlearned / ErrDegeneratedInput
        └─────────────┬────────────────────────────────┘
                      │ (Learned Subwords Validated)
                      ▼
@@ -309,32 +311,36 @@ fmt.Printf("Harvested %d drift events for active learning retraining.\n", len(ev
 
 ## 2-Layer Fail-Safe Guardrails & Error-Returning Routing (`RouteQuery`)
 
-In mission-critical backends, forced misclassification of unlearned words or out-of-distribution (OOD) noise causes catastrophic routing accidents (e.g. triggering an unauthorized refund on garbage input). NeuroGate enforces a **2-Layer Fail-Safe Defense**:
+In mission-critical backends, forced misclassification of unlearned words, repetitive flood attacks, or out-of-distribution (OOD) noise causes catastrophic routing accidents (e.g. triggering an unauthorized refund on garbage or repetitive input). NeuroGate enforces a hardened multi-tier defense:
 
 ```
 [ Incoming Query ]
         │
         ▼
-[ Layer 1: Tokenizer OOV / Single-Char Fallback ] ──(Ratio ≥ 0.70)──> ErrUnlearnedVocabulary (< 1 μs)
+[ Layer 1: Tokenizer OOV & Repetitive Flood Guard ] ──(SingleChar ≥ 0.70)──> ErrUnlearnedVocabulary (< 1 μs)
+        │                                           ──(UniqueRatio < 0.25)──> ErrDegeneratedInput    (< 1 μs)
         │ (Passed)
         ▼
-[ Layer 2: Neural Free Energy (LogSumExp) ] ───────(Energy < Min)────> ErrOutOfDomain (~29 μs)
+[ Layer 2: Neural Free Energy (LogSumExp) ] ──────────(Energy < Min)───────> ErrOutOfDomain (~29 μs)
         │ (Passed)
-[ Layer 2: Shannon Entropy & Margin ] ─────────────(Entropy > 1.5)───> ErrHighEntropy / ErrAmbiguousIntent
+[ Layer 2: Shannon Entropy & Margin ] ────────────────(Entropy > 1.5)──────> ErrHighEntropy / ErrAmbiguousIntent
         │ (Passed)
-[ Confident Safe Execution ] ────────────────────────────────────────> RouteDecision (~29 μs, 0 B/op)
+[ Confident Safe Execution ] ───────────────────────────────────────────────> RouteDecision (~29 μs, 0 B/op)
 ```
 
-### Layer 1: Tokenizer-Level Unlearned Vocabulary Cutoff (< 1 μs)
-When user input consists of completely unlearned slang, typos, or foreign gibberish, the BPE tokenizer breaks the text down into raw 1-character glyphs rather than learned subword tokens.
-- If single-character fallback tokens constitute **70%+ of total tokens** (`SingleCharRatio >= 0.70`), the engine **aborts immediately before running the neural network**, returning `ErrUnlearnedVocabulary`.
-- Zero floating-point matrix multiplications are executed, neutralizing attacks and noise in under 1 microsecond.
+### Layer 1: Tokenizer-Level Unlearned Vocabulary & Flood Cutoff (< 1 μs)
+Before invoking any neural forward arithmetic, Layer 1 executes two zero-allocation pre-checks:
+1. **Unlearned Fragment Cutoff (`SingleCharRatio >= 0.70`)**: If unlearned slang or gibberish causes BPE to fragment 70%+ of tokens into single-byte glyphs, the engine halts immediately with `ErrUnlearnedVocabulary`.
+2. **Repetitive Token Flood Guard (`UniqueTokenRatio < 0.25`)**: Repeatedly spamming a valid in-domain word (e.g. *"refund refund refund refund..."*) attempts to bypass OOD centroid guards. Layer 1 detects degenerated inputs with low unique token ratios and isolates them immediately with `ErrDegeneratedInput`.
 
 ### Layer 2: Neural Metric Cutoff (~29 μs)
 Standard Softmax enforces $\sum P_i = 1.0$, which causes neural networks to output artificially inflated confidence even on meaningless inputs. Layer 2 guards against this via:
 1. **Free Energy ($-\text{LogSumExp}$)**: Measures the absolute activation strength of unnormalized logits before Softmax. Unlearned inputs lack activation energy and are cleanly isolated.
 2. **Shannon Entropy**: Measures probability distribution chaos. High entropy ($> 1.5$) triggers OOD isolation.
 3. **Top-1 / Top-2 Margin Gap**: Narrow margin ($< 0.15$) detects intent collision, returning `ErrAmbiguousIntent`.
+
+### Deserialization Guard: Finite Tensor Verification (`math.IsNaN`, `math.IsInf`)
+Beyond SHA-256 integrity checksums, `DeserializeModel` actively validates all loaded tensor weights (`Embedding`, `Positional`, `W1`, `B1`, `W2`, `B2`). Any non-finite float value resulting from divergence during training is immediately rejected with `ErrCorruptedTensor`, preventing poisoned runtime states.
 
 ### Production Error-Returning Interface (`RouteQuery`)
 
@@ -366,6 +372,12 @@ func main() {
 	decision, err := router.RouteQuery(ctx, userInput)
 	if err != nil {
 		switch {
+		case errors.Is(err, neurogate.ErrDegeneratedInput):
+			// [Layer 1 Guard (< 1 μs)]: Repeated token flood or degenerated pattern
+			fmt.Printf("[L1 FLOOD REJECT] Degenerated input pattern (Unique token ratio: %.1f%%).\n",
+				decision.UniqueTokenRatio*100)
+			return
+
 		case errors.Is(err, neurogate.ErrUnlearnedVocabulary):
 			// [Layer 1 Guard (< 1 μs)]: Completely unlearned words or noisy characters
 			// Rejects before neural forward pass, eliminating cloud LLM invocation cost
@@ -475,10 +487,10 @@ Incoming Request ("it is too dark in here please switch on lamps")
    Internal inference operates on fixed stack buffers (`[16]float32` and `[64]float32`). Pre-tokenized inputs dispatched via `FilterTokens` execute in **~28 μs with strictly 0 B/op heap allocation**.
 2. **Single Shared Backbone (No Error Cascading)**:
    Avoids training multiple fragmented networks. A single compact encoder extracts context, while downstream safety boundaries and semantic boosts are computed geometrically.
-3. **Neuro-Symbolic Anchor Soft-Bias**:
-   Replaces fragile `strings.Contains` hardcoded branching with additive logit bonuses. Subword token IDs map to 64-bit masks (`uint64`), executing anchor boosts in a single CPU cycle (`&` and `popcount`).
-4. **Geometric L2 Cosine OOD Boundary**:
-   Compares normalized query embeddings against the calibrated domain manifold center ($C_{\text{domain}}$) using fast dot products, isolating OOD queries (e.g. quantum physics queries sent to an e-commerce router).
+3. **Neuro-Symbolic Anchor Soft-Bias with Max Clamping (`SetMaxAnchorBoost`)**:
+   Replaces fragile `strings.Contains` hardcoded branching with additive logit bonuses. Subword token IDs map to 64-bit masks (`uint64`), executing anchor boosts in a single CPU cycle (`&` and `popcount`). Cumulative boosts are capped per class (`DefaultMaxAnchorBoost = 3.0`), preventing multi-keyword payloads from overwhelming the neural boundary.
+4. **Adaptive L2 Cosine OOD Boundary (`CalibrateDomainDistribution`)**:
+   Beyond static radius thresholds, `CalibrateDomainDistribution` analyzes embedding manifold variance across training samples, computing an adaptive threshold $\text{MinCosine} = \mu - k\cdot\sigma$ to cleanly reject out-of-domain queries while maintaining 0 B/op runtime performance.
 
 ### NeuroGate Production Example
 
@@ -500,12 +512,15 @@ func main() {
 		log.Fatalf("NeuroGate init failed: %v", err)
 	}
 
-	// 2. Calibrate domain manifold centroid from training samples
+	// 2. Calibrate adaptive domain boundary with 2-sigma variance threshold
 	if samples, err := neurogate.LoadCSVDataset("data/demo_iot.csv"); err == nil {
-		gate.CalibrateDomainCentroid(samples)
+		gate.CalibrateDomainDistribution(samples, 2.0)
 	}
 
-	// 3. Bind route handlers with symbolic anchor soft-biases
+	// 3. Configure max anchor boost cap (prevents logit explosion)
+	gate.SetMaxAnchorBoost(3.0)
+
+	// 4. Bind route handlers with symbolic anchor soft-biases
 	gate.Bind("LightControl", func(ctx context.Context, payload any) error {
 		fmt.Println(">>> [GPIO 18 HIGH] Toggle Living Room Chandelier")
 		return nil
