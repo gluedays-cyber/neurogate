@@ -118,6 +118,7 @@ if strings.Contains(input, "refund") || strings.Contains(input, "cancel") {
 - **Zero Allocations on Hot Path (`0 B/op`)**: `PredictSlots` executes inference without triggering GC pressure, returning zero-heap stack results.
 - **Semantic XOR & Word Order Disambiguation**: Format v2 embeds 32 positional vectors coupled with non-linear $GELU(E_i + P_i)$ pooling, mathematically distinguishing permutations like `"delivery refund"` from `"refund delivery"`.
 - **3-Tier Decision Pipeline**: Classifies predictions into **Definite** (High confidence), **Ambiguous** (Borderline/narrow margin), or **Fallback** (Out-of-Distribution / High Shannon Entropy).
+- **100% Deterministic Reproducibility (`Seed`)**: Fixed pseudorandom seed configuration combined with map-iteration-invariant tie-breaking guarantees bit-identical weights, reproducible decision boundaries, and stable CI/CD regression testing.
 - **Multi-Intent Pipeline Support**: Automatically executes composite pipelines when secondary intent confidence meets multi-intent thresholds.
 - **Lock-Free Atomic Hot-Swap & Telemetry**: Replace model weights on live traffic without locks (`sync/atomic.Pointer`), and stream drift queries into a bounded ring buffer for active learning.
 
@@ -183,6 +184,7 @@ func main() {
 	cfg.Epochs = 50
 	cfg.LearningRate = 0.005
 	cfg.TargetVocabSize = 250
+	cfg.Seed = 42 // 100% deterministic bit-identical weight reproducibility
 
 	// Compile Little-Endian neural model in ~1.5s
 	model, err := neurogate.TrainModel(samples, cfg)

@@ -689,6 +689,7 @@ func main() {
 	config.Epochs = 50
 	config.LearningRate = 0.005
 	config.TargetVocabSize = 250
+	config.Seed = 42 // Guarantees 100% bit-for-bit reproducible weights
 
 	// 3. Execute BPE + AdamW training pipeline
 	model, err := neurogate.TrainModel(samples, config)
@@ -758,6 +759,18 @@ Epoch  20/50 - Train Loss: 0.0002 (Acc: 100.0%) | Val Loss: 0.4485 (Acc: 94.0%)
 
 - **Train Loss vs Val Loss**: Train accuracy reaching 100% with Val accuracy > 90% indicates strong generalization across unseen phrasing.
 - **Early Stopping**: The engine automatically halts training when validation loss stops improving, preventing overfitting and eliminating wasted CPU cycles. Total training finishes in ~1.5 to 2.0 seconds on standard CPUs.
+
+#### 5. Deterministic Training & Bit-for-Bit Reproducibility Guarantees
+
+In mission-critical enterprise environments and automated CI/CD pipelines, non-deterministic training leads to subtle floating-point drift across model compilations. Borderline queries hovering near decision boundaries can arbitrarily flip between a single classification and `Ambiguous` isolation.
+
+NeuroGate guarantees **100% bit-for-bit reproducible model compilation**:
+1. **Sorted Class Bucket Shuffling**: Traverses class buckets by strict integer class index (`0` through `numClasses - 1`), neutralizing Go runtime's randomized map iteration and guaranteeing identical pseudo-random number consumption across runs.
+2. **Deterministic BPE Tie-Breaking**: When multiple byte pairs share identical frequency counts in `TrainBPE`, the engine resolves ties deterministically using 64-bit key lexicographical comparison (`key < bestKey`), ensuring identical vocabulary order.
+3. **Reproducible Pseudorandom Seed (`cfg.Seed`)**:
+   - `Seed: 42` (Default in `DefaultTrainConfig()`): Produces consistent canonical weights.
+   - Any custom `int64` seed (e.g. `cfg.Seed = 1337`): Yields 100% identical weights, loss curves, and calibrated boundaries across every compilation run on the same dataset.
+   - Zero-fallback: If `cfg.Seed == 0`, the engine automatically injects the canonical default seed (`42`).
 
 ### Step 3: AI-Powered Branching — Microsecond Live Routing (`Dispatch`)
 
