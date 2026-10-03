@@ -93,14 +93,19 @@ type MatchSlot struct {
 
 // StaticInferenceResult encapsulates top-2 ranked prediction slots and uncertainty entropy on the stack.
 type StaticInferenceResult struct {
-	Primary     MatchSlot
-	Secondary   MatchSlot
-	LogitMargin float32
-	Entropy     float32
-	Energy      float32
-	Total       uint8
+	Primary       MatchSlot
+	Secondary     MatchSlot
+	LogitMargin   float32
+	Entropy       float32
+	Energy        float32
+	Total         uint8
+	CoActiveCount uint8   // Number of classes breaching positive activation threshold
+	Top1RawLogit  float32 // Unscaled raw logit of Primary candidate
+	Top2RawLogit  float32 // Unscaled raw logit of Secondary candidate
 }
 
+// DefaultActivationThreshold defines the minimum raw logit value indicating significant class activation.
+const DefaultActivationThreshold float32 = 0.0
 
 // computeEntropy calculates Shannon entropy in bits with epsilon guards to prevent NaN/Inf underflows.
 func computeEntropy(probs []float32) float32 {
@@ -112,8 +117,6 @@ func computeEntropy(probs []float32) float32 {
 	}
 	return float32(entropy)
 }
-
-
 
 // forwardInternal executes the forward computation directly inside the provided scratch buffer without allocations.
 func (m *InferenceModel) forwardInternal(tokenIDs []uint32, temperature float32, buf *inferenceBuffer) error {
@@ -178,10 +181,16 @@ func (m *InferenceModel) PredictSlots(tokenIDs []uint32, temperature float32) (S
 	var top1Idx, top2Idx int16 = -1, -1
 	var top1Prob, top2Prob float32 = -1.0, -1.0
 	var top1Logit, top2Logit float32 = -math.MaxFloat32, -math.MaxFloat32
+	var coActive uint8 = 0
 
 	for i, p := range buf.probs {
 		idx := int16(i)
 		logit := buf.logits[i]
+
+		if logit >= DefaultActivationThreshold {
+			coActive++
+		}
+
 		if p > top1Prob {
 			top2Prob = top1Prob
 			top2Idx = top1Idx
@@ -201,14 +210,17 @@ func (m *InferenceModel) PredictSlots(tokenIDs []uint32, temperature float32) (S
 	if top1Idx >= 0 {
 		res.Primary = MatchSlot{Index: top1Idx, Confidence: top1Prob}
 		res.Total = 1
+		res.Top1RawLogit = top1Logit
 	}
 	if top2Idx >= 0 {
 		res.Secondary = MatchSlot{Index: top2Idx, Confidence: top2Prob}
 		res.Total = 2
+		res.Top2RawLogit = top2Logit
 		res.LogitMargin = top1Logit - top2Logit
 	} else if top1Idx >= 0 {
 		res.LogitMargin = float32(math.MaxFloat32)
 	}
+	res.CoActiveCount = coActive
 	res.Entropy = computeEntropy(buf.probs)
 	res.Energy = LogSumExp(buf.logits)
 

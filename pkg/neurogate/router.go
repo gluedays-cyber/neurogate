@@ -62,6 +62,7 @@ type RouteDecision struct {
 	UnknownTokenRatio   float64            `json:"unknown_token_ratio"`
 	UniqueTokenRatio    float64            `json:"unique_token_ratio"`
 	LogitMargin         float32            `json:"logit_margin"`
+	CoActiveCount       uint8              `json:"co_active_count"`
 	SecondaryIntent     string             `json:"secondary_intent,omitempty"`
 	SecondaryConfidence float64            `json:"secondary_confidence,omitempty"`
 }
@@ -80,6 +81,7 @@ type RouteTrace struct {
 	Confidence         float64            `json:"confidence"`
 	Margin             float64            `json:"margin"`
 	LogitMargin        float32            `json:"logit_margin"`
+	CoActiveCount      uint8              `json:"co_active_count"`
 	Entropy            float64            `json:"entropy"`
 	Energy             float64            `json:"energy"`
 	Threshold          float64            `json:"threshold"`
@@ -400,6 +402,7 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 		Energy:              energy,
 		Margin:              margin,
 		LogitMargin:         res.LogitMargin,
+		CoActiveCount:       res.CoActiveCount,
 		SingleCharRatio:     singleRatio,
 		UnknownTokenRatio:   unkRatio,
 		UniqueTokenRatio:    uniqueRatio,
@@ -422,8 +425,9 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 		return decision, ErrLowConfidence
 	}
 
-	// 4. Ambiguity margin boundary (both probability margin & raw logit gap)
-	if primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin) {
+	// 4. Ambiguity margin boundary (both probability margin, raw logit gap, and co-activation conflict)
+	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin) || (res.CoActiveCount >= 2 && r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin*1.5)
+	if isAmbiguous {
 		return decision, ErrAmbiguousIntent
 	}
 
@@ -506,8 +510,8 @@ func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 		return r.fallback(ctx, payload)
 	}
 
-	// 2. Ambiguous Route: Borderline confidence, competitive margin gap, or narrow logit margin
-	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin)
+	// 2. Ambiguous Route: Borderline confidence, competitive margin gap, narrow logit margin, or co-activation conflict
+	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin) || (res.CoActiveCount >= 2 && r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin*1.5)
 	if isAmbiguous {
 		r.recordTelemetry(text, primaryLabel, secondaryLabel, primaryConf, entropy, true, false, false)
 		if r.ambiguous != nil {
@@ -628,6 +632,8 @@ func (r *Router) Inspect(text string) RouteTrace {
 	entropy := float64(computeEntropy(probs))
 	energy := float64(LogSumExp(probs))
 
+	slotRes, _ := model.PredictSlots(tokens, model.Temperature)
+
 	trace := RouteTrace{
 		InputText:          text,
 		TokenIDs:           tokens,
@@ -640,6 +646,8 @@ func (r *Router) Inspect(text string) RouteTrace {
 		SecondaryLabel:     secondLabel,
 		Confidence:         calibratedConfidence,
 		Margin:             margin,
+		LogitMargin:        slotRes.LogitMargin,
+		CoActiveCount:      slotRes.CoActiveCount,
 		Entropy:            entropy,
 		Energy:             energy,
 		Threshold:          r.policy.HighThreshold,
@@ -671,7 +679,7 @@ func (r *Router) Inspect(text string) RouteTrace {
 		if secondLabel != "" && calibratedSecond >= r.policy.PipelineThreshold {
 			trace.IsPipeline = true
 		}
-		if trace.Confidence < r.policy.HighThreshold || margin < r.policy.MarginCutoff {
+		if trace.Confidence < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && trace.LogitMargin < r.policy.RawLogitMargin) || (trace.CoActiveCount >= 2 && r.policy.RawLogitMargin > 0.0 && trace.LogitMargin < r.policy.RawLogitMargin*1.5) {
 			trace.IsAmbiguous = true
 		}
 		if _, exists := r.routes[bestLabel]; !exists {
@@ -755,7 +763,7 @@ func (r *Router) DispatchPipeline(ctx context.Context, text string, payload any)
 
 	// 3. Fallback to standard 3-tier routing if no pipeline applies
 	margin := primaryConf - secondaryConf
-	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin)
+	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin) || (res.CoActiveCount >= 2 && r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin*1.5)
 	if isAmbiguous {
 		r.recordTelemetry(text, primaryLabel, secondaryLabel, primaryConf, entropy, true, false, false)
 		if r.ambiguous != nil {

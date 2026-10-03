@@ -225,3 +225,78 @@ func TestTemperatureScaling_Effects(t *testing.T) {
 	}
 }
 
+// TestArchitectureFeedback_Case4_MultiIntentCoActivationConflict validates that queries with multiple competing class keywords
+// trigger co-activation ambiguity even if Softmax probability artificially skews toward one class.
+func TestArchitectureFeedback_Case4_MultiIntentCoActivationConflict(t *testing.T) {
+	tempDir := t.TempDir()
+	modelPath := filepath.Join(tempDir, "coactive_test.bin")
+	samples := []DataSample{
+		{Text: "turn on living room lights lamp brightness", Label: "LightControl"},
+		{Text: "set air conditioner cooling temperature thermostat", Label: "ClimateControl"},
+		{Text: "play soundbar volume audio music track", Label: "MediaControl"},
+	}
+	cfg := DefaultTrainConfig()
+	cfg.Epochs = 40
+	model, err := TrainModel(samples, cfg)
+	if err != nil {
+		t.Fatalf("TrainModel failed: %v", err)
+	}
+	if err := SaveBinaryModel(modelPath, model); err != nil {
+		t.Fatalf("SaveBinaryModel failed: %v", err)
+	}
+
+	gate, err := NewNeuroGate(modelPath)
+	if err != nil {
+		t.Fatalf("NewNeuroGate failed: %v", err)
+	}
+	gate.SetMinCosineSim(0.0) // Bypass cosine OOD to strictly test logit co-activation
+
+	// Mixed query containing representative tokens from multiple classes simultaneously
+	mixedQuery := "turn on lights and set air conditioner cooling temperature"
+	trace := gate.Inspect(mixedQuery)
+
+	if trace.CoActiveCount < 2 {
+		t.Logf("CoActiveCount is %d, logits=%v", trace.CoActiveCount, trace.ClassProbabilities)
+	}
+	if !trace.IsAmbiguous {
+		t.Errorf("Expected multi-intent mixed query to be marked ambiguous: Pred=%s, Conf=%.2f, Margin=%.2f, LogitMargin=%.2f, CoActive=%d, Fallback=%t",
+			trace.PredictedLabel, trace.Confidence, trace.Margin, trace.LogitMargin, trace.CoActiveCount, trace.IsFallback)
+	}
+}
+
+// TestArchitectureFeedback_Case5_CalibrateAdaptiveMargin validates that CalibrateDomainDistribution
+// dynamically computes and updates RawLogitMargin based on inter-class manifold distances.
+func TestArchitectureFeedback_Case5_CalibrateAdaptiveMargin(t *testing.T) {
+	tempDir := t.TempDir()
+	modelPath := filepath.Join(tempDir, "margin_cal_test.bin")
+	samples := []DataSample{
+		{Text: "cancel order and request refund billing", Label: "Refund"},
+		{Text: "track my courier shipping delivery status", Label: "Delivery"},
+	}
+	cfg := DefaultTrainConfig()
+	cfg.Epochs = 30
+	model, err := TrainModel(samples, cfg)
+	if err != nil {
+		t.Fatalf("TrainModel failed: %v", err)
+	}
+	if err := SaveBinaryModel(modelPath, model); err != nil {
+		t.Fatalf("SaveBinaryModel failed: %v", err)
+	}
+
+	gate, err := NewNeuroGate(modelPath)
+	if err != nil {
+		t.Fatalf("NewNeuroGate failed: %v", err)
+	}
+
+	initialMargin := gate.policy.RawLogitMargin
+
+	// Run Manifold Calibration
+	gate.CalibrateDomainDistribution(samples, 2.0)
+
+	calibratedMargin := gate.policy.RawLogitMargin
+	if calibratedMargin <= 0.0 {
+		t.Errorf("Expected positive calibrated margin, got %.4f", calibratedMargin)
+	}
+	t.Logf("Initial Margin: %.4f, Calibrated Margin: %.4f", initialMargin, calibratedMargin)
+}
+

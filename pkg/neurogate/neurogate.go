@@ -54,6 +54,7 @@ type GateTrace struct {
 	Confidence         float64            `json:"confidence"`
 	Margin             float64            `json:"margin"`
 	LogitMargin        float32            `json:"logit_margin"`
+	CoActiveCount      uint8              `json:"co_active_count"`
 	Entropy            float64            `json:"entropy"`
 	LogSumExp          float64            `json:"log_sum_exp"`
 	FreeEnergy         float64            `json:"free_energy"`
@@ -371,6 +372,69 @@ func (g *NeuroGate) CalibrateDomainDistribution(samples []DataSample, k float32)
 		g.minCosineSim = adaptiveMin
 	}
 
+	// Pass 3: Calculate Inter-Class Boundary Distance and Adaptive RawLogitMargin
+	classSums := make([][MaxGateEmbDim]float64, g.classCount)
+	classCounts := make([]int, g.classCount)
+	for _, s := range samples {
+		cIdx, exists := g.labelToIndex[s.Label]
+		if !exists || cIdx >= g.classCount {
+			continue
+		}
+		tokens := model.Tokenizer.Encode(s.Text)
+		if len(tokens) == 0 {
+			continue
+		}
+		if err := model.PredictFeatures(tokens, pooled[:embDim], dummyLogits[:g.classCount]); err == nil {
+			for d := 0; d < embDim; d++ {
+				classSums[cIdx][d] += float64(pooled[d])
+			}
+			classCounts[cIdx]++
+		}
+	}
+
+	classCentroids := make([][MaxGateEmbDim]float32, g.classCount)
+	for c := 0; c < g.classCount; c++ {
+		if classCounts[c] > 0 {
+			invC := 1.0 / float64(classCounts[c])
+			var rawC [MaxGateEmbDim]float32
+			for d := 0; d < embDim; d++ {
+				rawC[d] = float32(classSums[c][d] * invC)
+			}
+			L2Normalize(rawC[:embDim], classCentroids[c][:embDim])
+		}
+	}
+
+	minDist := float32(2.0)
+	validPairs := 0
+	for i := 0; i < g.classCount; i++ {
+		if classCounts[i] == 0 {
+			continue
+		}
+		for j := i + 1; j < g.classCount; j++ {
+			if classCounts[j] == 0 {
+				continue
+			}
+			sim := DotProduct(classCentroids[i][:embDim], classCentroids[j][:embDim])
+			dist := 1.0 - sim
+			if dist < minDist {
+				minDist = dist
+			}
+			validPairs++
+		}
+	}
+
+	if validPairs > 0 {
+		// Closely clustered classes require a stricter logit margin to disambiguate
+		adaptiveMargin := float32(0.50) * (2.0 - minDist)
+		if adaptiveMargin < 0.25 {
+			adaptiveMargin = 0.25
+		}
+		if adaptiveMargin > 1.20 {
+			adaptiveMargin = 1.20
+		}
+		g.policy.RawLogitMargin = adaptiveMargin
+	}
+
 	return g
 }
 
@@ -686,10 +750,14 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 	logSumExp := float64(maxLogit) + math.Log(sumExp)
 	freeEnergy := -logSumExp
 
-	// Compute raw top-1 and top-2 logit margin
+	// Compute raw top-1 and top-2 logit margin and co-activation count
 	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
+	var coActive uint8 = 0
 	for i := 0; i < numClasses; i++ {
 		l := adjustedLogits[i]
+		if l >= DefaultActivationThreshold {
+			coActive++
+		}
 		if l > maxLogit1 {
 			maxLogit2 = maxLogit1
 			maxLogit1 = l
@@ -739,6 +807,7 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 		Confidence:         calibratedConfidence,
 		Margin:             margin,
 		LogitMargin:        logitMargin,
+		CoActiveCount:      coActive,
 		Entropy:            entropy,
 		LogSumExp:          logSumExp,
 		FreeEnergy:         freeEnergy,
@@ -775,7 +844,7 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 				trace.IsPipeline = true
 			}
 		}
-		if trace.Confidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) {
+		if trace.Confidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) || (coActive >= 2 && g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin*1.5) {
 			trace.IsAmbiguous = true
 		}
 		if g.routes[bestIdx] == nil {
@@ -890,8 +959,12 @@ func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
 
 	// Logit margin computation
 	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
+	var coActive uint8 = 0
 	for i := 0; i < numClasses; i++ {
 		l := adjustedLogits[i]
+		if l >= DefaultActivationThreshold {
+			coActive++
+		}
 		if l > maxLogit1 {
 			maxLogit2 = maxLogit1
 			maxLogit1 = l
@@ -972,7 +1045,7 @@ func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
 			eval.isPipeline = true
 		}
 	}
-	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) {
+	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) || (coActive >= 2 && g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin*1.5) {
 		eval.isAmbiguous = true
 	}
 	if g.routes[bestIdx] == nil {
@@ -1164,8 +1237,12 @@ func (g *NeuroGate) evaluateFastTokens(tokens []uint32) gateEvaluation {
 
 	// Logit margin computation
 	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
+	var coActive uint8 = 0
 	for i := 0; i < numClasses; i++ {
 		l := adjustedLogits[i]
+		if l >= DefaultActivationThreshold {
+			coActive++
+		}
 		if l > maxLogit1 {
 			maxLogit2 = maxLogit1
 			maxLogit1 = l
@@ -1246,7 +1323,7 @@ func (g *NeuroGate) evaluateFastTokens(tokens []uint32) gateEvaluation {
 			eval.isPipeline = true
 		}
 	}
-	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) {
+	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) || (coActive >= 2 && g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin*1.5) {
 		eval.isAmbiguous = true
 	}
 	if g.routes[bestIdx] == nil {

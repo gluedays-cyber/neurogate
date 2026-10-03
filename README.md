@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v2.6.0_Hardened-purple.svg" alt="Release v2.6.0">
+  <img src="https://img.shields.io/badge/Release-v2.7.0_Hardened-purple.svg" alt="Release v2.7.0">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Latency-~30_μs-brightgreen.svg" alt="Latency"></a>
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Allocs-0_B/op_(0_allocs)-blue.svg" alt="Allocations"></a>
   <img src="https://img.shields.io/badge/Wire_Format-v2_Positional-orange.svg" alt="Format v2">
@@ -491,6 +491,8 @@ Incoming Request ("it is too dark in here please switch on lamps")
    Replaces fragile `strings.Contains` hardcoded branching with additive logit bonuses. Subword token IDs map to 64-bit masks (`uint64`), executing anchor boosts in a single CPU cycle (`&` and `popcount`). Cumulative boosts are capped per class (`DefaultMaxAnchorBoost = 3.0`), preventing multi-keyword payloads from overwhelming the neural boundary.
 4. **Adaptive L2 Cosine OOD Boundary (`CalibrateDomainDistribution`)**:
    Beyond static radius thresholds, `CalibrateDomainDistribution` analyzes embedding manifold variance across training samples, computing an adaptive threshold $\text{MinCosine} = \mu - k\cdot\sigma$ to cleanly reject out-of-domain queries while maintaining 0 B/op runtime performance.
+5. **Multi-Intent Co-Activation Density Guard & Dynamic Margin**:
+   When inputs contain conflicting keywords from multiple classes (e.g., `"light cooling door soundbar"`), Free Energy and Softmax can suffer from distortion. NeuroGate tracks pre-Softmax co-activation density (`CoActiveCount >= 2`) and automatically scales required logit margins by 1.5x. Furthermore, `CalibrateDomainDistribution` automatically measures inter-class centroid manifold distances, determining optimal `RawLogitMargin` without magic numbers.
 
 ### NeuroGate Production Example
 

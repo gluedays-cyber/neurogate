@@ -265,6 +265,8 @@ type RouteDecision struct {
 	SingleCharRatio     float64 `json:"single_char_ratio"`
 	UnknownTokenRatio   float64 `json:"unknown_token_ratio"`
 	UniqueTokenRatio    float64 `json:"unique_token_ratio"`
+	LogitMargin         float32 `json:"logit_margin"`
+	CoActiveCount       uint8   `json:"co_active_count"`
 	SecondaryIntent     string  `json:"secondary_intent,omitempty"`
 	SecondaryConfidence float64 `json:"secondary_confidence,omitempty"`
 }
@@ -558,7 +560,7 @@ router.SetSingleCharRatioCutoff(0.80)
 gate.SetSingleCharRatioCutoff(0.80)
 ```
 
-#### 3. Raw Logit Margin Ambiguity: `RawLogitMargin`
+#### 3. Raw Logit Margin Ambiguity & Multi-Intent Co-Activation Guard
 
 In addition to calibrated Softmax probability margin, `RawLogitMargin` validates the raw distance between the top-1 and top-2 logits before temperature exponentiation. If the raw logit gap is under the threshold (default: `0.35`), the request is isolated to `Ambiguous` handling:
 
@@ -567,6 +569,14 @@ policy := neurogate.DefaultDispatchPolicy()
 policy.RawLogitMargin = 0.50 // Require at least 0.50 unscaled logit difference
 router.SetPolicy(policy)
 ```
+
+##### Multi-Intent Co-Activation Density
+When an adversarial or composite sentence contains competing keywords across distinct classes (e.g. `"light cooling door soundbar"`), multiple output logits fire simultaneously. NeuroGate inspects pre-Softmax activation counts (`CoActiveCount uint8`). If two or more classes breach positive activation thresholds (`z >= 0.0`), the system automatically tightens the ambiguity margin requirement by 1.5x:
+
+$$\Delta z_{\text{required}} = 1.5 \times \gamma_{\text{margin}}$$
+
+##### Automatic Manifold Calibration
+Calling `gate.CalibrateDomainDistribution(samples, k)` automatically measures the minimum cosine distance between class centroids on the embedding manifold, dynamically deriving the optimal `RawLogitMargin` for your domain without manual heuristics or magic numbers.
 
 #### 4. Asymmetric Symbolic Inhibition: `Inhibit`
 
