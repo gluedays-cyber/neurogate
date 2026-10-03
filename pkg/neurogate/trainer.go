@@ -143,7 +143,11 @@ func geluDerivative(x float32) float32 {
 
 // TrainModel executes the complete training pipeline including BPE, AdamW optimization, and Early Stopping.
 func TrainModel(samples []DataSample, cfg TrainConfig) (*InferenceModel, error) {
-	rng := rand.New(rand.NewSource(cfg.Seed))
+	seed := cfg.Seed
+	if seed == 0 {
+		seed = 42
+	}
+	rng := rand.New(rand.NewSource(seed))
 
 	// 1. Collect unique labels
 	labelMap := make(map[string]uint32)
@@ -192,7 +196,8 @@ func TrainModel(samples []DataSample, cfg TrainConfig) (*InferenceModel, error) 
 	var valSet []EncodedSample
 
 	// Stratified split: ensure every class has representation in both train and validation
-	for _, b := range classBuckets {
+	for cID := uint32(0); cID < uint32(numClasses); cID++ {
+		b := classBuckets[cID]
 		rng.Shuffle(len(b), func(i, j int) {
 			b[i], b[j] = b[j], b[i]
 		})

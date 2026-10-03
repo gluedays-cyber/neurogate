@@ -99,7 +99,7 @@ func TrainBPE(corpus []string, targetVocabSize int) (*BPETokenizer, error) {
 		var bestKey uint64
 		var maxFreq int
 		for key, freq := range pairCounts {
-			if freq > maxFreq {
+			if freq > maxFreq || (freq == maxFreq && (bestKey == 0 || key < bestKey)) {
 				maxFreq = freq
 				bestKey = key
 			}

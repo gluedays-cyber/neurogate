@@ -155,6 +155,71 @@ func TestRFC_LegacyVersion2BackwardCompatibility(t *testing.T) {
 	}
 }
 
+// TestRFC_DeterministicTraining_SeedReproducibility tests 100% deterministic weight reproduction with fixed seed.
+func TestRFC_DeterministicTraining_SeedReproducibility(t *testing.T) {
+	samples := []DataSample{
+		{Text: "cancel order and refund money", Label: "Refund"},
+		{Text: "request payment refund please", Label: "Refund"},
+		{Text: "package tracking delivery status", Label: "Delivery"},
+		{Text: "where is my delivery parcel", Label: "Delivery"},
+	}
+
+	cfg1 := DefaultTrainConfig()
+	cfg1.Epochs = 20
+	cfg1.Seed = 1337
+	model1, err := TrainModel(samples, cfg1)
+	if err != nil {
+		t.Fatalf("TrainModel 1 failed: %v", err)
+	}
+
+	cfg2 := DefaultTrainConfig()
+	cfg2.Epochs = 20
+	cfg2.Seed = 1337
+	model2, err := TrainModel(samples, cfg2)
+	if err != nil {
+		t.Fatalf("TrainModel 2 failed: %v", err)
+	}
+
+	// 1. Verify weights match exactly byte-for-byte between model1 and model2
+	if len(model1.Weights.Embedding) != len(model2.Weights.Embedding) {
+		t.Fatalf("Embedding length mismatch: %d vs %d", len(model1.Weights.Embedding), len(model2.Weights.Embedding))
+	}
+	for i := range model1.Weights.Embedding {
+		if model1.Weights.Embedding[i] != model2.Weights.Embedding[i] {
+			t.Fatalf("Embedding weight mismatch at index %d: %f vs %f", i, model1.Weights.Embedding[i], model2.Weights.Embedding[i])
+		}
+	}
+	for i := range model1.Weights.W1 {
+		if model1.Weights.W1[i] != model2.Weights.W1[i] {
+			t.Fatalf("W1 weight mismatch at index %d: %f vs %f", i, model1.Weights.W1[i], model2.Weights.W1[i])
+		}
+	}
+	for i := range model1.Weights.W2 {
+		if model1.Weights.W2[i] != model2.Weights.W2[i] {
+			t.Fatalf("W2 weight mismatch at index %d: %f vs %f", i, model1.Weights.W2[i], model2.Weights.W2[i])
+		}
+	}
+
+	// 2. Verify model with different seed produces different weights
+	cfg3 := DefaultTrainConfig()
+	cfg3.Epochs = 20
+	cfg3.Seed = 9999
+	model3, err := TrainModel(samples, cfg3)
+	if err != nil {
+		t.Fatalf("TrainModel 3 failed: %v", err)
+	}
+
+	diffCount := 0
+	for i := range model1.Weights.W1 {
+		if model1.Weights.W1[i] != model3.Weights.W1[i] {
+			diffCount++
+		}
+	}
+	if diffCount == 0 {
+		t.Error("Expected different seed (9999) to produce different weights, but got identical weights")
+	}
+}
+
 // TestRFC_ZeroAllocationBenchmark verifies that inference remains strictly zero-allocation.
 func BenchmarkRFC_ZeroAllocationInference(b *testing.B) {
 	samples := []DataSample{
