@@ -277,3 +277,54 @@ func (t *BPETokenizer) IsUnlearned(tokens []uint32, maxSingleRatio float64, maxU
 	return false
 }
 
+// ScanUnlearnedPatterns scans text with zero allocations for non-semantic random hex/base64 sequences.
+func ScanUnlearnedPatterns(text string) bool {
+	n := len(text)
+	if n < 6 {
+		return false
+	}
+
+	for i := 0; i < n; i++ {
+		// 1. Hex sequence detection: 0x or 0X followed by >= 4 hex characters
+		if i+1 < n && text[i] == '0' && (text[i+1] == 'x' || text[i+1] == 'X') {
+			hexCount := 0
+			for j := i + 2; j < n; j++ {
+				c := text[j]
+				if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+					hexCount++
+				} else {
+					break
+				}
+			}
+			if hexCount >= 4 {
+				return true
+			}
+		}
+
+		// 2. Continuous uppercase hex block (e.g. DEADBEEF, A1B2C3D4 >= 8 chars)
+		c := text[i]
+		if (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') {
+			hexCount := 1
+			hasAlpha := (c >= 'A' && c <= 'F')
+			j := i + 1
+			for ; j < n; j++ {
+				cj := text[j]
+				if (cj >= '0' && cj <= '9') || (cj >= 'A' && cj <= 'F') {
+					hexCount++
+					if cj >= 'A' && cj <= 'F' {
+						hasAlpha = true
+					}
+				} else {
+					break
+				}
+			}
+			if hexCount >= 8 && hasAlpha {
+				return true
+			}
+			i = j
+		}
+	}
+	return false
+}
+
+

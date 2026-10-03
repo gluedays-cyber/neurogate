@@ -22,6 +22,7 @@ var (
 
 	// Fail-Safe Sentinel Errors (Layer 1 & Layer 2)
 	ErrUnlearnedVocabulary = errors.New("neurogate: input dominated by unlearned subwords or OOV fragments")
+	ErrUnlearnedPattern    = errors.New("neurogate: unlearned random/hex pattern detected")
 	ErrDegeneratedInput    = errors.New("neurogate: degenerated repetitive token sequence detected")
 	ErrLowConfidence       = errors.New("neurogate: prediction confidence below safety threshold")
 	ErrHighEntropy         = errors.New("neurogate: prediction entropy exceeds uncertainty boundary")
@@ -92,11 +93,12 @@ type MatchSlot struct {
 
 // StaticInferenceResult encapsulates top-2 ranked prediction slots and uncertainty entropy on the stack.
 type StaticInferenceResult struct {
-	Primary   MatchSlot
-	Secondary MatchSlot
-	Entropy   float32
-	Energy    float32
-	Total     uint8
+	Primary     MatchSlot
+	Secondary   MatchSlot
+	LogitMargin float32
+	Entropy     float32
+	Energy      float32
+	Total       uint8
 }
 
 
@@ -110,6 +112,8 @@ func computeEntropy(probs []float32) float32 {
 	}
 	return float32(entropy)
 }
+
+
 
 // forwardInternal executes the forward computation directly inside the provided scratch buffer without allocations.
 func (m *InferenceModel) forwardInternal(tokenIDs []uint32, temperature float32, buf *inferenceBuffer) error {
@@ -173,17 +177,23 @@ func (m *InferenceModel) PredictSlots(tokenIDs []uint32, temperature float32) (S
 
 	var top1Idx, top2Idx int16 = -1, -1
 	var top1Prob, top2Prob float32 = -1.0, -1.0
+	var top1Logit, top2Logit float32 = -math.MaxFloat32, -math.MaxFloat32
 
 	for i, p := range buf.probs {
 		idx := int16(i)
+		logit := buf.logits[i]
 		if p > top1Prob {
 			top2Prob = top1Prob
 			top2Idx = top1Idx
+			top2Logit = top1Logit
+
 			top1Prob = p
 			top1Idx = idx
+			top1Logit = logit
 		} else if p > top2Prob {
 			top2Prob = p
 			top2Idx = idx
+			top2Logit = logit
 		}
 	}
 
@@ -195,6 +205,9 @@ func (m *InferenceModel) PredictSlots(tokenIDs []uint32, temperature float32) (S
 	if top2Idx >= 0 {
 		res.Secondary = MatchSlot{Index: top2Idx, Confidence: top2Prob}
 		res.Total = 2
+		res.LogitMargin = top1Logit - top2Logit
+	} else if top1Idx >= 0 {
+		res.LogitMargin = float32(math.MaxFloat32)
 	}
 	res.Entropy = computeEntropy(buf.probs)
 	res.Energy = LogSumExp(buf.logits)
@@ -221,6 +234,9 @@ func (m *InferenceModel) PredictTokens(tokenIDs []uint32) (string, float64, erro
 func (m *InferenceModel) PredictDetailed(text string) (StaticInferenceResult, float64, error) {
 	if !utf8.ValidString(text) {
 		return StaticInferenceResult{}, 0.0, ErrEmptyInput
+	}
+	if ScanUnlearnedPatterns(text) {
+		return StaticInferenceResult{}, 1.0, ErrUnlearnedPattern
 	}
 	if len(text) > MaxInputBytes {
 		text = TruncateToRuneBoundary(text, MaxInputBytes)

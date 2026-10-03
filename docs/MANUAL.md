@@ -27,6 +27,8 @@ This guide provides pure Go engineers with a deep-dive technical manual and hand
    - [Active Learning: `EnableTelemetry` & `DrainTelemetry`](#310-enabletelemetry--draintelemetry)
    - [Zero Allocations: `PredictSlots`](#311-predictslots-zero-allocation-inference)
    - [NeuroGate 3-Head Engine: `NewNeuroGate`](#312-neurogate-3-head-geometric-intelligent-filter-engine)
+   - [Temperature Scaling: `SetTemperature` & `Temperature`](#313-temperature-scaling-settemperature--temperature)
+   - [Pre-Neural & Structural Guardrails: `ScanUnlearnedPatterns` & `SetSingleCharRatioCutoff`](#314-pre-neural--structural-guardrails)
 4. [End-to-End Production Tutorial](#4-end-to-end-production-tutorial)
    - [Step 1: AI Design — Structuring Domain Knowledge (`dataset.csv`)](#step-1-ai-design--structuring-domain-knowledge-datasetcsv)
    - [Step 2: Building Your Own AI — Training & Model Generation (`ib-train`)](#step-2-building-your-own-ai--training--model-generation-ib-train)
@@ -150,6 +152,7 @@ Defines 3-tier confidence boundaries, margin cutoffs, Shannon entropy limits, an
 // FailSafe Sentinel Errors (Layer 1 & Layer 2)
 var (
 	ErrUnlearnedVocabulary = errors.New("neurogate: input dominated by unlearned subwords or OOV fragments")
+	ErrUnlearnedPattern    = errors.New("neurogate: unlearned random/hex pattern detected")
 	ErrDegeneratedInput    = errors.New("neurogate: degenerated repetitive token sequence detected")
 	ErrLowConfidence       = errors.New("neurogate: prediction confidence below safety threshold")
 	ErrHighEntropy         = errors.New("neurogate: prediction entropy exceeds uncertainty boundary")
@@ -160,16 +163,19 @@ var (
 type DispatchPolicy struct {
     HighThreshold        float64 `json:"high_threshold"`            // Min confidence for definite execution (default: 0.75)
     LowThreshold         float64 `json:"low_threshold"`             // Min confidence below which request goes to Fallback (default: 0.40)
-    MarginCutoff         float64 `json:"margin_cutoff"`             // Min required gap between Top-1 and Top-2 (default: 0.15)
+    MarginCutoff         float64 `json:"margin_cutoff"`             // Min required gap between Top-1 and Top-2 probabilities (default: 0.15)
     MaxEntropy           float64 `json:"max_entropy"`               // Max allowable prediction entropy before OOD isolation (default: 2.0)
     PipelineThreshold    float64 `json:"pipeline_threshold"`        // Min secondary confidence for multi-intent pipeline (default: 0.30)
     MinLogSumExp         float64 `json:"min_log_sum_exp,omitempty"` // Min log-sum-exp energy boundary before OOD isolation (0 disables)
-    MaxSingleCharRatio   float64 `json:"max_single_char_ratio"`     // Layer 1: Max ratio of single-char fallback tokens (default: 0.70)
+    MaxSingleCharRatio   float64 `json:"max_single_char_ratio"`     // Layer 1: Max ratio of single-char fallback tokens (default: 0.85)
     MaxUnknownTokenRatio float64 `json:"max_unknown_token_ratio"`   // Layer 1: Max ratio of UNK tokens (default: 0.30)
     MinUniqueTokenRatio  float64 `json:"min_unique_token_ratio"`    // Layer 1: Min ratio of unique tokens to block repetitive flood abuse (default: 0.25)
+    EnablePatternGuard   bool    `json:"enable_pattern_guard"`      // Layer 1: Enable pre-inference random hex/base64 pattern check (default: true)
+    RawLogitMargin       float32 `json:"raw_logit_margin"`          // Layer 2: Minimum required gap between Top-1 and Top-2 raw logits (default: 0.35)
 }
 
 func (r *Router) SetPolicy(policy DispatchPolicy) *Router
+func (r *Router) SetSingleCharRatioCutoff(cutoff float64) *Router
 ```
 
 ---
@@ -419,7 +425,11 @@ func NewNeuroGateWithModel(model *InferenceModel) *NeuroGate
 | :--- | :--- | :--- |
 | **`Bind`** | `.Bind(label string, handler RouteAction) *GateRouteBuilder` | Registers an action handler and returns a builder for symbolic anchor chaining. |
 | **`WithAnchor`** | `.WithAnchor(weight float32, keywords ...string) *GateRouteBuilder` | Maps keywords to 64-bit bitmasks, injecting an additive logit bias scaled by matched bits in 1 CPU cycle. |
+| **`Inhibit`** | `.Inhibit(penalty float32, competingLabels ...string) *GateRouteBuilder` | Applies an asymmetric negative penalty to competing labels when anchor keywords match. |
 | **`SetMaxAnchorBoost`**| `.SetMaxAnchorBoost(cap float32) *NeuroGate` | Enforces a strict upper bound (clamping limit) on cumulative anchor bias per class to prevent logit explosion. |
+| **`SetTemperature`** | `.SetTemperature(t float32) *NeuroGate` | Adjusts the softmax temperature scaling parameter dynamically on active models. |
+| **`Temperature`** | `.Temperature() float32` | Returns the current softmax temperature factor (default: `1.0`). |
+| **`SetSingleCharRatioCutoff`** | `.SetSingleCharRatioCutoff(cutoff float64) *NeuroGate` | Configures Layer 1 threshold for single-character token fallback ratio (default: `0.85`). |
 | **`CalibrateDomainCentroid`** | `.CalibrateDomainCentroid(samples []DataSample) *NeuroGate` | Computes the true L2 manifold centroid of domain sentences for geometric OOD gating. |
 | **`CalibrateDomainDistribution`** | `.CalibrateDomainDistribution(samples []DataSample, k float32) *NeuroGate` | Computes manifold centroid and dynamic $\text{MinCosine} = \mu - k\cdot\sigma$ based on embedding variance. |
 | **`DomainStats`** | `.DomainStats() (hasCentroid bool, meanSim, stdDev, minCosine float32)` | Returns current calibrated manifold statistics. |
@@ -475,6 +485,97 @@ func main() {
 	ctx := context.Background()
 	_ = gate.Filter(ctx, "it is too dark in here please switch on lamps", nil)
 }
+```
+
+---
+
+### 3.13. Temperature Scaling: `SetTemperature` & `Temperature`
+
+Temperature scaling is a post-processing calibration technique applied directly to raw logits prior to the stack-allocated Softmax computation. It modifies model output confidence without altering relative prediction rankings or allocating memory on the heap.
+
+```go
+func (r *Router) SetTemperature(t float32) *Router
+func (r *Router) Temperature() float32
+
+func (g *NeuroGate) SetTemperature(t float32) *NeuroGate
+func (g *NeuroGate) Temperature() float32
+```
+
+#### Mathematical Formulation
+
+For unnormalized logit vector $z = [z_1, z_2, \dots, z_K]$ and scalar temperature parameter $T > 0$:
+
+$$p_i = \frac{\exp(z_i / T)}{\sum_{j=1}^K \exp(z_j / T)}$$
+
+| Parameter Setting | Mathematical Effect | Operational Impact | Recommended Use Case |
+| :--- | :--- | :--- | :--- |
+| **$T = 1.0$ (Default)** | Standard Softmax distribution | Unmodified raw model confidence | Standard calibrated models |
+| **$T > 1.0$ ($1.2 \sim 2.0$)** | Softens logits ($z_i / T \to 0$), increases Shannon entropy | Mitigates neural overconfidence; elevates ambiguous fallbacks for borderline inputs | High-risk safety-critical routing where false positives must be routed to human review |
+| **$0 < T < 1.0$ ($0.5 \sim 0.8$)** | Amplifies logit differentials ($z_i / T \to \infty$), concentrates probability | Sharpens top-1 class probability; decreases borderline ambiguity triggers | High-confidence intent routing on well-separated domain clusters |
+
+#### Practical Code Example
+
+```go
+// 1. Initialize engine
+router, err := neurogate.NewRouter("weights/model.bin", 0.75)
+if err != nil {
+    log.Fatal(err)
+}
+
+// 2. Adjust temperature scaling dynamically
+router.SetTemperature(1.5)
+fmt.Printf("Active Softmax Temperature: %.2f\n", router.Temperature())
+
+// 3. Inference automatically applies T=1.5 in zero-allocation Softmax
+decision, err := router.RouteQuery(ctx, "can u cancel my recent order")
+if err != nil {
+    log.Printf("Routed to fallback / ambiguous: %v", err)
+}
+```
+
+---
+
+### 3.14. Pre-Neural & Structural Guardrails
+
+NeuroGate v2.6.0 introduces multi-layer structural guardrails to prevent adversarial out-of-distribution bypasses, degenerate repeated character sequences, and competitive logit collisions.
+
+#### 1. Zero-Allocation Pattern Guard: `ScanUnlearnedPatterns`
+
+Scans ASCII and UTF-8 byte sequences with zero allocations in less than 1 μs prior to tokenizer execution. Blocks non-semantic random hexadecimal blocks (`0xdeadbeef`, `A1B2C3D4`) before any vector arithmetic or forward pass occurs:
+
+```go
+// Direct utility function export
+isPattern := neurogate.ScanUnlearnedPatterns("user input 0x7fa28bc3") // returns true -> ErrUnlearnedPattern
+```
+
+#### 2. Single-Character Fallback Ratio: `SetSingleCharRatioCutoff`
+
+When user input consists of completely unlearned vocabulary, the BPE tokenizer breaks terms down to raw individual runes/characters. If the proportion of single-character tokens exceeds the cutoff, the request is immediately rejected with `ErrUnlearnedVocabulary`:
+
+```go
+// Default is 0.85 (85% single character tokens)
+router.SetSingleCharRatioCutoff(0.80)
+gate.SetSingleCharRatioCutoff(0.80)
+```
+
+#### 3. Raw Logit Margin Ambiguity: `RawLogitMargin`
+
+In addition to calibrated Softmax probability margin, `RawLogitMargin` validates the raw distance between the top-1 and top-2 logits before temperature exponentiation. If the raw logit gap is under the threshold (default: `0.35`), the request is isolated to `Ambiguous` handling:
+
+```go
+policy := neurogate.DefaultDispatchPolicy()
+policy.RawLogitMargin = 0.50 // Require at least 0.50 unscaled logit difference
+router.SetPolicy(policy)
+```
+
+#### 4. Asymmetric Symbolic Inhibition: `Inhibit`
+
+When defining symbolic anchors on `NeuroGate`, `.Inhibit()` penalizes competing classes when specific keyword anchors are observed, preventing misrouting on shared vocabulary:
+
+```go
+gate.Bind("Refund", handleRefund).
+    WithAnchor(2.0, "refund", "moneyback").
+    Inhibit(1.5, "Delivery", "Account") // Subtracts 1.5 from Delivery and Account logits
 ```
 
 ---

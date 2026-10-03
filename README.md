@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v2.5.0_Hardened-purple.svg" alt="Release v2.5.0">
+  <img src="https://img.shields.io/badge/Release-v2.6.0_Hardened-purple.svg" alt="Release v2.6.0">
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Latency-~30_μs-brightgreen.svg" alt="Latency"></a>
   <a href="#benchmarks"><img src="https://img.shields.io/badge/Allocs-0_B/op_(0_allocs)-blue.svg" alt="Allocations"></a>
   <img src="https://img.shields.io/badge/Wire_Format-v2_Positional-orange.svg" alt="Format v2">
@@ -621,10 +621,14 @@ go run ./cmd/ib-demo -domain fintech  # 6. FinTech Transaction Memo Audit & Frau
 | Method / Struct | Signature | Operational Role |
 | :--- | :--- | :--- |
 | **`NewRouter`** | `NewRouter(path string, threshold float64) (*Router, error)` | Loads v2 binary weights, initializes atomic model pointer, and builds 3-tier router. |
-| **`SetPolicy`** | `.SetPolicy(policy DispatchPolicy) *Router` | Configures high/low thresholds, top-1/top-2 margin cutoff, OOD max entropy, and pipeline boundaries. |
+| **`SetPolicy`** | `.SetPolicy(policy DispatchPolicy) *Router` | Configures high/low thresholds, margin cutoffs, raw logit margins, OOD entropy, and fail-safe rules. |
+| **`SetTemperature`** | `.SetTemperature(t float32) *Router` / `*NeuroGate` | Configures temperature scaling factor for Softmax probability smoothing ($T > 1.0$) or sharpening ($T < 1.0$). |
+| **`Temperature`** | `.Temperature() float32` | Retrieves current temperature scaling factor (default: `1.0`). |
+| **`SetSingleCharRatioCutoff`** | `.SetSingleCharRatioCutoff(cutoff float64) *Router` / `*NeuroGate` | Configures Layer 1 threshold for unlearned single-character token ratio (default: `0.85`). |
+| **`ScanUnlearnedPatterns`** | `ScanUnlearnedPatterns(text string) bool` | Pre-inference zero-alloc guard (< 1 μs) intercepting random hex/base64 strings. |
 | **`Bind`** | `.Bind(label string, handler RouteAction) *Router` | Associates a trained class with a Go handler: `func(ctx context.Context, payload any) error`. |
 | **`BindPipeline`** | `.BindPipeline(p, s string, handler PipelineAction) *Router` | Registers composite handler triggered when primary and secondary intents are both eligible. |
-| **`Ambiguous`** | `.Ambiguous(handler AmbiguousAction) *Router` | Intercepts borderline confidence or narrow margin queries to prompt user confirmation. |
+| **`Ambiguous`** | `.Ambiguous(handler AmbiguousAction) *Router` | Intercepts borderline confidence, probability margin, or raw logit margin anomalies. |
 | **`Fallback`** | `.Fallback(handler RouteAction) *Router` | Designates safety handler for low confidence, high unknown token ratio, or OOD entropy. |
 | **`RouteQuery`** | `.RouteQuery(ctx context.Context, text string) (RouteDecision, error)` | Evaluates 2-layer fail-safe guards and returns standard Go sentinel errors. |
 | **`Dispatch`** | `.Dispatch(ctx context.Context, text string, payload any) error` | Evaluates 3-tier routing with 2-layer guards and executes bound branch in ~30 μs. |
@@ -632,7 +636,23 @@ go run ./cmd/ib-demo -domain fintech  # 6. FinTech Transaction Memo Audit & Frau
 | **`Reload`** | `.Reload(path string) error` | Atomically swaps weights on live traffic without locks (`0 ns` stop-the-world). |
 | **`EnableTelemetry`**| `.EnableTelemetry(capacity int) *Router` | Allocates thread-safe ring buffer capturing ambiguous, OOD, and pipeline requests. |
 | **`DrainTelemetry`** | `.DrainTelemetry() []TelemetryEvent` | Extracts collected drift events in FIFO order for active learning retraining. |
-| **`PredictSlots`** | `model.PredictSlots(text string, out *StaticInferenceResult) error` | Stack-allocated inference primitive achieving strictly **`0 B/op, 0 allocs/op`**. |
+| **`PredictSlots`** | `model.PredictSlots(tokens []uint32, temperature float32) (StaticInferenceResult, error)` | Stack-allocated inference primitive achieving strictly **`0 B/op, 0 allocs/op`**. |
+
+### Temperature Scaling
+
+NeuroGate applies temperature scaling directly within its stack-allocated Softmax computation:
+
+$$\sigma(z)_i = \frac{e^{z_i / T}}{\sum_{j=1}^K e^{z_j / T}}$$
+
+- **Default ($T = 1.0$)**: Standard unscaled Softmax distribution.
+- **Higher Temperature ($T > 1.0$, e.g. $1.5 \sim 2.0$)**: Softens logit disparities, reducing neural overconfidence and elevating entropy for borderline/unclear queries. Ideal when strict safety boundaries and ambiguity prompts are preferred.
+- **Lower Temperature ($0 < T < 1.0$, e.g. $0.5 \sim 0.7$)**: Sharpens probability distribution towards the dominant class, reducing ambiguity on well-defined distinct intents.
+
+```go
+// Adjust temperature dynamically on live Router or NeuroGate instances
+router.SetTemperature(1.5)
+fmt.Printf("Current inference temperature: %.2f\n", router.Temperature())
+```
 
 ---
 

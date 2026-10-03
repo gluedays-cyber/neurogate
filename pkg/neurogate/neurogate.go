@@ -30,10 +30,12 @@ var (
 
 // AnchorRule defines a symbolic soft-bias injected into a specific class logit upon bitmask match.
 type AnchorRule struct {
-	ClassIndex int
-	Mask       uint64
-	Weight     float32
-	Keywords   []string
+	ClassIndex     int
+	Mask           uint64
+	Weight         float32
+	InhibitClasses []int
+	Penalty        float32
+	Keywords       []string
 }
 
 // GateTrace captures comprehensive runtime metrics across all three geometric heads.
@@ -51,6 +53,7 @@ type GateTrace struct {
 	SecondaryLabel     string             `json:"secondary_label,omitempty"`
 	Confidence         float64            `json:"confidence"`
 	Margin             float64            `json:"margin"`
+	LogitMargin        float32            `json:"logit_margin"`
 	Entropy            float64            `json:"entropy"`
 	LogSumExp          float64            `json:"log_sum_exp"`
 	FreeEnergy         float64            `json:"free_energy"`
@@ -111,6 +114,26 @@ func (b *GateRouteBuilder) WithAnchor(weight float32, keywords ...string) *GateR
 	return b
 }
 
+// Inhibit registers competing class labels to penalize when this anchor triggers.
+func (b *GateRouteBuilder) Inhibit(penalty float32, competingLabels ...string) *GateRouteBuilder {
+	b.gate.mu.Lock()
+	defer b.gate.mu.Unlock()
+
+	if len(b.gate.anchorRules) == 0 {
+		return b
+	}
+	lastIdx := len(b.gate.anchorRules) - 1
+	rule := &b.gate.anchorRules[lastIdx]
+
+	for _, lbl := range competingLabels {
+		if cIdx, exists := b.gate.labelToIndex[lbl]; exists {
+			rule.InhibitClasses = append(rule.InhibitClasses, cIdx)
+		}
+	}
+	rule.Penalty = penalty
+	return b
+}
+
 // Bind allows continuing chaining for additional routes.
 func (b *GateRouteBuilder) Bind(label string, handler RouteAction) *GateRouteBuilder {
 	return b.gate.Bind(label, handler)
@@ -163,6 +186,7 @@ func NewNeuroGateWithModel(model *InferenceModel) *NeuroGate {
 		minCosineSim:   0.25,
 		maxAnchorBoost: DefaultMaxAnchorBoost,
 	}
+	gate.policy.MaxSingleCharRatio = 0.85
 	gate.model.Store(model)
 
 	// Pre-register model labels up to MaxGateClasses
@@ -404,6 +428,35 @@ func (g *NeuroGate) SetPolicy(policy DispatchPolicy) *NeuroGate {
 	return g
 }
 
+// SetSingleCharRatioCutoff configures the Layer 1 unlearned single-character token ratio threshold.
+func (g *NeuroGate) SetSingleCharRatioCutoff(cutoff float64) *NeuroGate {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.policy.MaxSingleCharRatio = cutoff
+	return g
+}
+
+
+// SetTemperature configures the temperature scaling factor used in softmax calculations.
+func (g *NeuroGate) SetTemperature(t float32) *NeuroGate {
+    g.mu.Lock()
+    defer g.mu.Unlock()
+    if m := g.model.Load(); m != nil {
+        m.Temperature = t
+    }
+    return g
+}
+
+// Temperature returns the current temperature scaling factor.
+func (g *NeuroGate) Temperature() float32 {
+    g.mu.RLock()
+    defer g.mu.RUnlock()
+    if m := g.model.Load(); m != nil {
+        return m.Temperature
+    }
+    return 0
+}
+
 // Bind registers an action handler for a target class label, returning a GateRouteBuilder for anchor chaining.
 func (g *NeuroGate) Bind(label string, handler RouteAction) *GateRouteBuilder {
 	g.mu.Lock()
@@ -475,6 +528,16 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 		}
 	}
 
+	if g.policy.EnablePatternGuard && ScanUnlearnedPatterns(text) {
+		return GateTrace{
+			InputText:      text,
+			IsFallback:     true,
+			FallbackReason: "unlearned pattern detected",
+			Threshold:      g.policy.HighThreshold,
+			LatencyMicros:  time.Since(start).Microseconds(),
+		}
+	}
+
 	if len(text) > MaxInputBytes {
 		text = TruncateToRuneBoundary(text, MaxInputBytes)
 	}
@@ -485,6 +548,7 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 			InputText:      text,
 			IsFallback:     true,
 			FallbackReason: "empty input tokens",
+			Threshold:      g.policy.HighThreshold,
 			LatencyMicros:  time.Since(start).Microseconds(),
 		}
 	}
@@ -492,6 +556,7 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 		tokens = tokens[:MaxSequenceTokens]
 	}
 
+	singleRatio, _ := model.Tokenizer.AnalyzeUnlearnedRatio(tokens)
 	subwords := make([]string, len(tokens))
 	unkCount := 0
 	unkID, hasUnk := model.Tokenizer.VocabMap["[UNK]"]
@@ -555,11 +620,16 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 		if matchedBits != 0 {
 			count := float32(bits.OnesCount64(matchedBits))
 			classDeltas[rule.ClassIndex] += rule.Weight * count
+			for _, inhClass := range rule.InhibitClasses {
+				if inhClass >= 0 && inhClass < numClasses {
+					classDeltas[inhClass] -= rule.Penalty * count
+				}
+			}
 		}
 	}
 	for c := 0; c < numClasses; c++ {
 		delta := classDeltas[c]
-		if g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
+		if delta > 0 && g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
 			delta = g.maxAnchorBoost
 		}
 		adjustedLogits[c] += delta
@@ -616,6 +686,22 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 	logSumExp := float64(maxLogit) + math.Log(sumExp)
 	freeEnergy := -logSumExp
 
+	// Compute raw top-1 and top-2 logit margin
+	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
+	for i := 0; i < numClasses; i++ {
+		l := adjustedLogits[i]
+		if l > maxLogit1 {
+			maxLogit2 = maxLogit1
+			maxLogit1 = l
+		} else if l > maxLogit2 {
+			maxLogit2 = l
+		}
+	}
+	var logitMargin float32 = 0.0
+	if numClasses >= 2 {
+		logitMargin = maxLogit1 - maxLogit2
+	}
+
 	// -------------------------------------------------------------
 	// [Head 1 & Head 3]: Unified OOD & Energy Guard
 	// -------------------------------------------------------------
@@ -624,6 +710,9 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 	if g.hasCentroid && cosineSim < g.minCosineSim {
 		isOOD = true
 		oodReason = fmt.Sprintf("cosine similarity %.4f below domain threshold %.4f (OOD)", cosineSim, g.minCosineSim)
+	} else if len(tokens) >= 2 && g.policy.MaxSingleCharRatio > 0 && singleRatio >= g.policy.MaxSingleCharRatio {
+		isOOD = true
+		oodReason = fmt.Sprintf("unlearned vocabulary (single-char ratio %.2f >= %.2f)", singleRatio, g.policy.MaxSingleCharRatio)
 	} else if g.policy.MinLogSumExp > 0 && logSumExp < g.policy.MinLogSumExp {
 		isOOD = true
 		oodReason = fmt.Sprintf("free energy %.4f (logSumExp %.4f) below in-distribution threshold %.4f (OOD)", freeEnergy, logSumExp, g.policy.MinLogSumExp)
@@ -649,6 +738,7 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 		SecondaryLabel:     secondLabel,
 		Confidence:         calibratedConfidence,
 		Margin:             margin,
+		LogitMargin:        logitMargin,
 		Entropy:            entropy,
 		LogSumExp:          logSumExp,
 		FreeEnergy:         freeEnergy,
@@ -685,7 +775,7 @@ func (g *NeuroGate) Inspect(text string) GateTrace {
 				trace.IsPipeline = true
 			}
 		}
-		if trace.Confidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff {
+		if trace.Confidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) {
 			trace.IsAmbiguous = true
 		}
 		if g.routes[bestIdx] == nil {
@@ -707,6 +797,10 @@ type gateEvaluation struct {
 
 // evaluateFast executes the 3-head gate on the stack without allocating diagnostic maps or traces.
 func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
+	if g.policy.EnablePatternGuard && ScanUnlearnedPatterns(text) {
+		return gateEvaluation{isFallback: true}
+	}
+
 	model := g.model.Load()
 	if model == nil {
 		return gateEvaluation{isFallback: true}
@@ -722,6 +816,11 @@ func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
 	}
 	if len(tokens) > MaxSequenceTokens {
 		tokens = tokens[:MaxSequenceTokens]
+	}
+
+	singleRatio, _ := model.Tokenizer.AnalyzeUnlearnedRatio(tokens)
+	if len(tokens) >= 2 && g.policy.MaxSingleCharRatio > 0 && singleRatio >= g.policy.MaxSingleCharRatio {
+		return gateEvaluation{isFallback: true}
 	}
 
 	unkCount := 0
@@ -774,14 +873,35 @@ func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
 		if matchedBits != 0 {
 			count := float32(bits.OnesCount64(matchedBits))
 			classDeltas[rule.ClassIndex] += rule.Weight * count
+			for _, inhClass := range rule.InhibitClasses {
+				if inhClass >= 0 && inhClass < numClasses {
+					classDeltas[inhClass] -= rule.Penalty * count
+				}
+			}
 		}
 	}
 	for c := 0; c < numClasses; c++ {
 		delta := classDeltas[c]
-		if g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
+		if delta > 0 && g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
 			delta = g.maxAnchorBoost
 		}
 		adjustedLogits[c] += delta
+	}
+
+	// Logit margin computation
+	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
+	for i := 0; i < numClasses; i++ {
+		l := adjustedLogits[i]
+		if l > maxLogit1 {
+			maxLogit2 = maxLogit1
+			maxLogit1 = l
+		} else if l > maxLogit2 {
+			maxLogit2 = l
+		}
+	}
+	var logitMargin float32 = 0.0
+	if numClasses >= 2 {
+		logitMargin = maxLogit1 - maxLogit2
 	}
 
 	// [Head 3]: Softmax, Margin, and Entropy
@@ -852,7 +972,7 @@ func (g *NeuroGate) evaluateFast(text string) gateEvaluation {
 			eval.isPipeline = true
 		}
 	}
-	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff {
+	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) {
 		eval.isAmbiguous = true
 	}
 	if g.routes[bestIdx] == nil {
@@ -1027,14 +1147,35 @@ func (g *NeuroGate) evaluateFastTokens(tokens []uint32) gateEvaluation {
 		if matchedBits != 0 {
 			count := float32(bits.OnesCount64(matchedBits))
 			classDeltas[rule.ClassIndex] += rule.Weight * count
+			for _, inhClass := range rule.InhibitClasses {
+				if inhClass >= 0 && inhClass < numClasses {
+					classDeltas[inhClass] -= rule.Penalty * count
+				}
+			}
 		}
 	}
 	for c := 0; c < numClasses; c++ {
 		delta := classDeltas[c]
-		if g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
+		if delta > 0 && g.maxAnchorBoost > 0 && delta > g.maxAnchorBoost {
 			delta = g.maxAnchorBoost
 		}
 		adjustedLogits[c] += delta
+	}
+
+	// Logit margin computation
+	var maxLogit1, maxLogit2 float32 = -math.MaxFloat32, -math.MaxFloat32
+	for i := 0; i < numClasses; i++ {
+		l := adjustedLogits[i]
+		if l > maxLogit1 {
+			maxLogit2 = maxLogit1
+			maxLogit1 = l
+		} else if l > maxLogit2 {
+			maxLogit2 = l
+		}
+	}
+	var logitMargin float32 = 0.0
+	if numClasses >= 2 {
+		logitMargin = maxLogit1 - maxLogit2
 	}
 
 	// [Head 3]: Stack Softmax, Margin, and Entropy
@@ -1105,7 +1246,7 @@ func (g *NeuroGate) evaluateFastTokens(tokens []uint32) gateEvaluation {
 			eval.isPipeline = true
 		}
 	}
-	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff {
+	if calibratedConfidence < g.policy.HighThreshold || margin < g.policy.MarginCutoff || (g.policy.RawLogitMargin > 0.0 && logitMargin < g.policy.RawLogitMargin) {
 		eval.isAmbiguous = true
 	}
 	if g.routes[bestIdx] == nil {

@@ -30,10 +30,13 @@ func TestNeuroGateBasicAndAnchors(t *testing.T) {
 	if err := SaveBinaryModel(modelPath, model); err != nil {
 		t.Fatalf("SaveBinaryModel failed: %v", err)
 	}
-
 	gate, err := NewNeuroGate(modelPath)
 	if err != nil {
 		t.Fatalf("NewNeuroGate failed: %v", err)
+	}
+	gate.SetTemperature(1.5)
+	if gate.Temperature() != 1.5 {
+		t.Fatalf("expected temperature 1.5, got %v", gate.Temperature())
 	}
 
 	var lightTriggered, fallbackTriggered bool

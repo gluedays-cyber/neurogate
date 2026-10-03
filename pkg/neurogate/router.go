@@ -30,6 +30,8 @@ type DispatchPolicy struct {
 	MaxSingleCharRatio   float64 `json:"max_single_char_ratio"`     // Layer 1: Max ratio of single-char fallback tokens (default: 0.70)
 	MaxUnknownTokenRatio float64 `json:"max_unknown_token_ratio"`   // Layer 1: Max ratio of UNK tokens (default: 0.30)
 	MinUniqueTokenRatio  float64 `json:"min_unique_token_ratio"`    // Layer 1: Min ratio of unique tokens to block flood/repetition (default: 0.25)
+	EnablePatternGuard   bool    `json:"enable_pattern_guard"`      // Layer 0: Zero-alloc scan for random hex/base64 patterns (default: true)
+	RawLogitMargin       float32 `json:"raw_logit_margin"`          // Layer 2: Minimum required gap between Top-1 and Top-2 raw logits (default: 0.35)
 }
 
 // DefaultDispatchPolicy creates standard production-ready 3-tier routing criteria.
@@ -44,6 +46,8 @@ func DefaultDispatchPolicy() DispatchPolicy {
 		MaxSingleCharRatio:   0.70,
 		MaxUnknownTokenRatio: 0.30,
 		MinUniqueTokenRatio:  0.25,
+		EnablePatternGuard:   true,
+		RawLogitMargin:       0.35,
 	}
 }
 
@@ -57,6 +61,7 @@ type RouteDecision struct {
 	SingleCharRatio     float64            `json:"single_char_ratio"`
 	UnknownTokenRatio   float64            `json:"unknown_token_ratio"`
 	UniqueTokenRatio    float64            `json:"unique_token_ratio"`
+	LogitMargin         float32            `json:"logit_margin"`
 	SecondaryIntent     string             `json:"secondary_intent,omitempty"`
 	SecondaryConfidence float64            `json:"secondary_confidence,omitempty"`
 }
@@ -74,6 +79,7 @@ type RouteTrace struct {
 	SecondaryLabel     string             `json:"secondary_label,omitempty"`
 	Confidence         float64            `json:"confidence"`
 	Margin             float64            `json:"margin"`
+	LogitMargin        float32            `json:"logit_margin"`
 	Entropy            float64            `json:"entropy"`
 	Energy             float64            `json:"energy"`
 	Threshold          float64            `json:"threshold"`
@@ -259,6 +265,34 @@ func (r *Router) Fallback(action RouteAction) *Router {
 	return r
 }
 
+// SetSingleCharRatioCutoff configures the Layer 1 unlearned single-character token ratio threshold.
+func (r *Router) SetSingleCharRatioCutoff(cutoff float64) *Router {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.policy.MaxSingleCharRatio = cutoff
+	return r
+}
+
+// SetTemperature configures the temperature scaling factor used in softmax calculations.
+func (r *Router) SetTemperature(t float32) *Router {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if m := r.model.Load(); m != nil {
+		m.Temperature = t
+	}
+	return r
+}
+
+// Temperature returns the current temperature scaling factor.
+func (r *Router) Temperature() float32 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if m := r.model.Load(); m != nil {
+		return m.Temperature
+	}
+	return 0
+}
+
 // RouteQuery executes 2-layer fail-safe evaluation and returns standard Go sentinel errors on failure.
 func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, error) {
 	select {
@@ -284,6 +318,11 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 	}
 	if len(text) > MaxInputBytes {
 		text = TruncateToRuneBoundary(text, MaxInputBytes)
+	}
+
+	// Guard 0: Pre-inference pattern detection (< 1 μs)
+	if r.policy.EnablePatternGuard && ScanUnlearnedPatterns(text) {
+		return RouteDecision{}, ErrUnlearnedPattern
 	}
 
 	tokenIDs := model.Tokenizer.Encode(text)
@@ -360,6 +399,7 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 		Entropy:             entropy,
 		Energy:              energy,
 		Margin:              margin,
+		LogitMargin:         res.LogitMargin,
 		SingleCharRatio:     singleRatio,
 		UnknownTokenRatio:   unkRatio,
 		UniqueTokenRatio:    uniqueRatio,
@@ -382,8 +422,8 @@ func (r *Router) RouteQuery(ctx context.Context, text string) (RouteDecision, er
 		return decision, ErrLowConfidence
 	}
 
-	// 4. Ambiguity margin boundary
-	if primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff {
+	// 4. Ambiguity margin boundary (both probability margin & raw logit gap)
+	if primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin) {
 		return decision, ErrAmbiguousIntent
 	}
 
@@ -409,6 +449,12 @@ func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 
 	model := r.model.Load()
 	if model == nil {
+		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
+		return r.fallback(ctx, payload)
+	}
+
+	// Guard 0: Pre-inference pattern validation
+	if r.policy.EnablePatternGuard && ScanUnlearnedPatterns(text) {
 		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
 		return r.fallback(ctx, payload)
 	}
@@ -460,8 +506,8 @@ func (r *Router) Dispatch(ctx context.Context, text string, payload any) error {
 		return r.fallback(ctx, payload)
 	}
 
-	// 2. Ambiguous Route: Borderline confidence or competitive margin gap
-	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff
+	// 2. Ambiguous Route: Borderline confidence, competitive margin gap, or narrow logit margin
+	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin)
 	if isAmbiguous {
 		r.recordTelemetry(text, primaryLabel, secondaryLabel, primaryConf, entropy, true, false, false)
 		if r.ambiguous != nil {
@@ -498,6 +544,17 @@ func (r *Router) Inspect(text string) RouteTrace {
 			InputText:      text,
 			IsFallback:     true,
 			FallbackReason: "model not loaded",
+			Threshold:      r.threshold,
+			LatencyMicros:  time.Since(start).Microseconds(),
+		}
+	}
+
+	// Guard 0: Pre-inference pattern check
+	if r.policy.EnablePatternGuard && ScanUnlearnedPatterns(text) {
+		return RouteTrace{
+			InputText:      text,
+			IsFallback:     true,
+			FallbackReason: "unlearned pattern detected",
 			Threshold:      r.threshold,
 			LatencyMicros:  time.Since(start).Microseconds(),
 		}
@@ -647,6 +704,12 @@ func (r *Router) DispatchPipeline(ctx context.Context, text string, payload any)
 		return r.fallback(ctx, payload)
 	}
 
+	// Guard 0: Pre-inference pattern validation
+	if r.policy.EnablePatternGuard && ScanUnlearnedPatterns(text) {
+		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
+		return r.fallback(ctx, payload)
+	}
+
 	res, unkRatio, err := model.PredictDetailed(text)
 	if err != nil || res.Total == 0 {
 		r.recordTelemetry(text, "", "", 0, 0, false, false, true)
@@ -692,7 +755,7 @@ func (r *Router) DispatchPipeline(ctx context.Context, text string, payload any)
 
 	// 3. Fallback to standard 3-tier routing if no pipeline applies
 	margin := primaryConf - secondaryConf
-	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff
+	isAmbiguous := primaryConf < r.policy.HighThreshold || margin < r.policy.MarginCutoff || (r.policy.RawLogitMargin > 0.0 && res.LogitMargin < r.policy.RawLogitMargin)
 	if isAmbiguous {
 		r.recordTelemetry(text, primaryLabel, secondaryLabel, primaryConf, entropy, true, false, false)
 		if r.ambiguous != nil {

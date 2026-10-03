@@ -26,6 +26,7 @@ var (
 	ErrModelNotInitialized = core.ErrModelNotInitialized
 	ErrClassIndexOutOfRange = core.ErrClassIndexOutOfRange
 	ErrUnlearnedVocabulary = core.ErrUnlearnedVocabulary
+	ErrUnlearnedPattern    = core.ErrUnlearnedPattern
 	ErrDegeneratedInput    = core.ErrDegeneratedInput
 	ErrCorruptedTensor     = core.ErrCorruptedTensor
 	ErrLowConfidence       = core.ErrLowConfidence
@@ -60,5 +61,6 @@ var (
 	LogSumExp                 = core.LogSumExp
 	CosineSimilarity          = core.CosineSimilarity
 	CalculateUniqueTokenRatio = core.CalculateUniqueTokenRatio
+	ScanUnlearnedPatterns     = core.ScanUnlearnedPatterns
 )
 
